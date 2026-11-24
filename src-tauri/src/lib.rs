@@ -16,8 +16,8 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 static APP_STARTED: OnceLock<Instant> = OnceLock::new();
-const UPDATE_REPOSITORY: &str = "mutedvector/gptvoice-discord";
-const UPDATE_RELEASES_URL: &str = "https://github.com/mutedvector/gptvoice-discord/releases";
+const UPDATE_REPOSITORY: &str = "dassystemapp-ux/gptvoice-discord";
+const UPDATE_RELEASES_URL: &str = "https://github.com/dassystemapp-ux/gptvoice-discord/releases";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

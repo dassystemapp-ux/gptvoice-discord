@@ -54,8 +54,10 @@ guilds receive isolated subprofiles automatically.
    connection automatically. The guild ID selects the server used for startup
    status and thread prefetching; other servers can still use the global slash
    commands.
-6. Join a Discord voice channel and run `/join` in a text channel where the
-   bot can send messages.
+6. Join a Discord voice channel. GPTVoice does not auto-join when the app
+   starts or when a member enters a room; run `/join` in a text channel where
+   the bot can send messages, or use the server member panel's **Join voice**
+   button, whenever you are ready to start a live ChatGPT Voice session.
 7. On the first run, GPTVoice opens its dedicated browser profile. Sign into
    ChatGPT and complete any human verification yourself. Then run `/join`
    again.
@@ -64,7 +66,11 @@ guilds receive isolated subprofiles automatically.
    **New thread + Voice** or select a recent thread and choose **Resume + Voice**.
 
 After Voice starts, the Status tab shows the active Voice, Intelligence, and
-Language values prefetched from ChatGPT. If ChatGPT reports that microphone
+Language values prefetched from ChatGPT. To protect limited ChatGPT Voice
+allowances, GPTVoice ends the Live session and leaves the Discord voice channel
+after five minutes without detected speech. Run `/join` or press **Join voice**
+to start another session. Leaving manually with `/leave` also stops the
+dedicated ChatGPT browser session. If ChatGPT reports that microphone
 access must be enabled in Settings, choose **Show browser**, grant the
 permission, then choose **Reconnect Voice**. Reconnect refreshes the ChatGPT
 page before starting Voice again.
@@ -100,6 +106,8 @@ After a successful `/join`, GPTVoice posts one shared panel in the server. The
 panel is intentionally small so members do not need access to the desktop app:
 
 - **Join voice** and **Leave voice** control this server's Discord voice relay.
+- GPTVoice joins only on an explicit request; it never starts a paid/limited
+  ChatGPT Live session simply because a member joined a Discord room.
 - **Mute input** and **Unmute input** control the ChatGPT microphone stream.
 - **Reconnect** refreshes the ChatGPT Voice connection for the active thread.
 - The panel shows the active thread, current Voice, Intelligence, and Language.
@@ -126,7 +134,9 @@ password and never upload them.
 
 ## Slash commands
 
-- `/join` - join the current voice channel and start the guild relay.
+- `/join` - explicitly join the current voice channel and start the guild relay.
+  The relay leaves after five minutes without detected speech to preserve the
+  ChatGPT Voice allowance.
 - `/leave` - leave the voice channel and stop the guild session.
 - `/status` - show whether the Discord gateway is connected.
 

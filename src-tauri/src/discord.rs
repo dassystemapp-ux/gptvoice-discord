@@ -21,8 +21,11 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+const VOICE_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const VOICE_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +59,7 @@ pub struct DiscordRuntime {
     status: Arc<Mutex<DiscordStatus>>,
     voice_guilds: Arc<Mutex<HashSet<u64>>>,
     voice_joining: Arc<Mutex<HashSet<u64>>>,
+    voice_idle_monitors: Arc<Mutex<HashMap<u64, tauri::async_runtime::JoinHandle<()>>>>,
     member_panels: Arc<Mutex<HashMap<u64, (serenity::all::ChannelId, MessageId)>>>,
     member_panel_monitor: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     http: Arc<Mutex<Option<Arc<Http>>>>,
@@ -151,7 +155,24 @@ impl DiscordRuntime {
         if let Ok(mut guilds) = self.voice_guilds.lock() {
             guilds.remove(&guild_id.get());
         }
+        if let Ok(mut monitors) = self.voice_idle_monitors.lock() {
+            if let Some(monitor) = monitors.remove(&guild_id.get()) {
+                monitor.abort();
+            }
+        }
         self.emit_status(app);
+    }
+
+    fn set_voice_idle_monitor(
+        &self,
+        guild_id: GuildId,
+        monitor: tauri::async_runtime::JoinHandle<()>,
+    ) {
+        if let Ok(mut monitors) = self.voice_idle_monitors.lock() {
+            if let Some(previous) = monitors.insert(guild_id.get(), monitor) {
+                previous.abort();
+            }
+        }
     }
 
     fn start_member_panel_monitor(&self, app: &AppHandle, browsers: browser::BrowserRuntime) {
@@ -339,6 +360,11 @@ impl DiscordRuntime {
         if let Ok(mut guilds) = self.voice_guilds.lock() {
             guilds.clear();
         }
+        if let Ok(mut monitors) = self.voice_idle_monitors.lock() {
+            for (_, monitor) in monitors.drain() {
+                monitor.abort();
+            }
+        }
         if let Ok(mut http) = self.http.lock() {
             *http = None;
         }
@@ -359,6 +385,7 @@ struct ReceiveToBrowser {
     app: AppHandle,
     guild_id: GuildId,
     ticks: AtomicU64,
+    last_voice_activity: Arc<Mutex<Instant>>,
 }
 
 struct VoiceJoinAttemptGuard {
@@ -547,8 +574,9 @@ fn member_panel_embed(
     };
     let intelligence = browser.and_then(|status| status.intelligence.as_deref());
     let language = browser.and_then(|status| status.language.as_deref());
-    let mut description =
-        format!("**{state}**\nThis panel controls the shared GPTVoice session for this server.");
+    let mut description = format!(
+        "**{state}**\nThis panel controls the shared GPTVoice session for this server. Voice auto-join is disabled: press Join voice or use /join when you want to talk. The bot leaves after 5 minutes without speech to preserve the ChatGPT Voice allowance."
+    );
     if let Some(last_action) = last_action.map(str::trim).filter(|value| !value.is_empty()) {
         description.push_str(&format!("\n\n_{last_action}_"));
     }
@@ -680,6 +708,16 @@ impl songbird::EventHandler for ReceiveToBrowser {
                 counts[index] += 1;
             }
         }
+        if has_voice_activity(
+            speaking_users,
+            decoded_samples,
+            non_silent_samples,
+            frame_len,
+        ) {
+            if let Ok(mut last_activity) = self.last_voice_activity.lock() {
+                *last_activity = Instant::now();
+            }
+        }
         for (sample, count) in mixed.iter_mut().zip(counts) {
             if count > 1 {
                 *sample = (*sample as i32 / count as i32) as i16;
@@ -697,6 +735,20 @@ impl songbird::EventHandler for ReceiveToBrowser {
         }
         None
     }
+}
+
+fn has_voice_activity(
+    speaking_users: usize,
+    decoded_samples: u64,
+    non_silent_samples: u64,
+    frame_len: usize,
+) -> bool {
+    if speaking_users == 0 || decoded_samples == 0 {
+        return false;
+    }
+
+    let minimum_samples = ((frame_len as u64) / 50).max(24);
+    non_silent_samples >= minimum_samples
 }
 
 fn command_definitions() -> Vec<CreateCommand> {
@@ -769,55 +821,10 @@ impl EventHandler for Handler {
             }
         }
 
-        // Recovery/testing convenience: if the configured guild has exactly one
-        // occupied human voice channel when the bot starts, rejoin that channel.
-        // Never guess when members are spread across multiple voice channels.
-        if let Some(guild_id) = self.guild_id {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let active_voice_states = context
-                .cache
-                .guild(guild_id)
-                .map(|guild| {
-                    guild
-                        .voice_states
-                        .iter()
-                        .filter_map(|(user_id, state)| {
-                            if *user_id == ready.user.id {
-                                return None;
-                            }
-                            state.channel_id.map(|channel_id| (*user_id, channel_id))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let active_channels = active_voice_states
-                .iter()
-                .map(|(_, channel_id)| *channel_id)
-                .collect::<HashSet<_>>();
-            if active_channels.len() == 1 {
-                if let Some((user_id, _)) = active_voice_states.first() {
-                    let _ = self.app.emit(
-                        "runtime-log",
-                        format!(
-                            "[auto-join] Exactly one occupied voice channel detected in guild {}.",
-                            guild_id.get()
-                        ),
-                    );
-                    let result = self.join_voice(&context, Some(guild_id), *user_id).await;
-                    let _ = self
-                        .app
-                        .emit("runtime-log", format!("[auto-join] {result}"));
-                }
-            } else {
-                let _ = self.app.emit(
-                    "runtime-log",
-                    format!(
-                        "[auto-join] Skipped: found {} occupied voice channel(s); no channel was selected.",
-                        active_channels.len()
-                    ),
-                );
-            }
-        }
+        let _ = self.app.emit(
+            "runtime-log",
+            "Voice auto-join is disabled. Members must use /join or the Join voice panel button.",
+        );
     }
 
     async fn voice_state_update(&self, context: Context, old: Option<VoiceState>, new: VoiceState) {
@@ -897,62 +904,9 @@ impl EventHandler for Handler {
             }
         }
 
-        // Follow the exact channel the member entered. If another voice-state
-        // event is already joining, retry briefly instead of silently missing
-        // this move. join_voice reads the member's latest cached channel each time.
-        if let Some(target_channel) = current_channel {
-            let _ = self.app.emit(
-                "runtime-log",
-                format!(
-                    "[auto-join] Member {} entered voice channel {}; following them.",
-                    new.user_id.get(),
-                    target_channel.get()
-                ),
-            );
-
-            let mut result = String::new();
-            for attempt in 1..=10 {
-                result = self.join_voice(&context, Some(guild_id), new.user_id).await;
-                if !result.contains("already attempting to connect") {
-                    break;
-                }
-                let _ = self.app.emit(
-                    "runtime-log",
-                    format!(
-                        "[auto-join] Join is busy; retrying after a short delay ({attempt}/10)."
-                    ),
-                );
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-
-            let joined = result.starts_with("Joined your voice channel")
-                || result.contains("already connected to this server's voice channel");
-            let _ = self
-                .app
-                .emit("runtime-log", format!("[auto-join] {result}"));
-
-            if joined {
-                let prompt = "You are DAS Bot, the friendly voice assistant for DAS. Greet the new member in a natural Saudi Arabic voice. Say exactly: \u{64a}\u{627}\u{20}\u{647}\u{644}\u{627}\u{20}\u{641}\u{64a}\u{643}\u{60c}\u{20}\u{62d}\u{64a}\u{651}\u{627}\u{643}\u{20}\u{627}\u{644}\u{644}\u{647}\u{20}\u{645}\u{639}\u{646}\u{627}\u{20}\u{641}\u{64a}\u{20}\u{631}\u{648}\u{645}\u{20}\u{44}\u{41}\u{53}. Do not mention any name or prior conversation.";
-                match self
-                    .browsers
-                    .speak_text_guild(&self.app, &guild_id.get().to_string(), prompt)
-                    .await
-                {
-                    Ok(()) => {
-                        let _ = self.app.emit(
-                            "runtime-log",
-                            "[greeting] Sent a short Arabic voice greeting for the new member.",
-                        );
-                    }
-                    Err(error) => {
-                        let _ = self.app.emit(
-                            "runtime-log",
-                            format!("[greeting] Could not start the voice greeting: {error}"),
-                        );
-                    }
-                }
-            }
-        }
+        // Voice joining is an explicit user action (/join or the member-panel
+        // button). Merely entering or moving between Discord rooms must not open
+        // a long-running ChatGPT Live session or consume the server's voice quota.
     }
 
     async fn message(&self, context: Context, new_message: Message) {
@@ -1336,6 +1290,7 @@ impl Handler {
 
         // Songbird can emit receive events during the voice join handshake.
         // Install VoiceTick before join, otherwise early user audio can be missed.
+        let last_voice_activity = Arc::new(Mutex::new(Instant::now()));
         let call = songbird.get_or_insert(guild_id);
         {
             let mut call = call.lock().await;
@@ -1354,6 +1309,7 @@ impl Handler {
                     app: self.app.clone(),
                     guild_id,
                     ticks: AtomicU64::new(0),
+                    last_voice_activity: Arc::clone(&last_voice_activity),
                 },
             );
         }
@@ -1408,7 +1364,7 @@ impl Handler {
         // Starting the Discord relay only opens the dedicated ChatGPT page.
         // Explicitly activate ChatGPT Voice after the Discord connection is ready
         // so a fresh launch or automatic rejoin is immediately conversational.
-        match self
+        let voice_active = match self
             .browsers
             .reconnect_voice_guild(&self.app, &guild_id.get().to_string())
             .await
@@ -1417,10 +1373,11 @@ impl Handler {
                 let _ = self.app.emit(
                     "runtime-log",
                     format!(
-                        "[voice:{}] ChatGPT Voice is active after joining Discord.",
+                        "[voice:{}] ChatGPT Voice is active after the explicit join.",
                         guild_id.get()
                     ),
                 );
+                true
             }
             Ok(_) => {
                 let _ = self.app.emit(
@@ -1430,19 +1387,83 @@ impl Handler {
                         guild_id.get()
                     ),
                 );
+                false
             }
             Err(error) => {
                 let _ = self.app.emit(
                     "runtime-log",
                     format!(
-                        "[voice:{}] Could not auto-start ChatGPT Voice after joining Discord: {error}",
+                        "[voice:{}] Could not start ChatGPT Voice after the explicit join: {error}",
                         guild_id.get()
                     ),
+                );
+                false
+            }
+        };
+
+        if voice_active {
+            let greeting = "You are DAS Bot, the friendly voice assistant for DAS. Greet the group in a natural Saudi Arabic voice. Say exactly: يا هلا فيكم، حيّاكم الله معنا في روم DAS. Do not mention any name or prior conversation.";
+            if let Err(error) = self
+                .browsers
+                .speak_text_guild(&self.app, &guild_id.get().to_string(), greeting)
+                .await
+            {
+                let _ = self.app.emit(
+                    "runtime-log",
+                    format!("[greeting] Could not send the voice greeting: {error}"),
                 );
             }
         }
 
-        "Joined your voice channel, connected the continuous audio relay, and attempted to start ChatGPT Voice automatically. The administrator can control ChatGPT from the GPTVoice desktop Status panel.".to_owned()
+        let runtime = self.runtime.clone();
+        let browsers = self.browsers.clone();
+        let app = self.app.clone();
+        let monitor_context = context.clone();
+        let activity = Arc::clone(&last_voice_activity);
+        let idle_monitor = tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(VOICE_IDLE_CHECK_INTERVAL).await;
+                if !runtime.voice_connected(guild_id) {
+                    break;
+                }
+                let idle_for = activity
+                    .lock()
+                    .map(|last_activity| last_activity.elapsed())
+                    .unwrap_or_default();
+                if idle_for < VOICE_IDLE_TIMEOUT {
+                    continue;
+                }
+
+                let message = format!(
+                    "[voice:{}] No speech detected for {} minutes; stopping ChatGPT Voice and leaving Discord to preserve the voice allowance.",
+                    guild_id.get(),
+                    VOICE_IDLE_TIMEOUT.as_secs() / 60
+                );
+                log::info!("{message}");
+                let _ = app.emit("runtime-log", message);
+
+                if let Err(error) = browsers.stop_guild(&app, &guild_id.get().to_string()).await {
+                    let _ = app.emit(
+                        "runtime-log",
+                        format!(
+                            "[voice:{}] Could not stop the idle ChatGPT session: {error}",
+                            guild_id.get()
+                        ),
+                    );
+                }
+                if let Some(songbird) = songbird::get(&monitor_context).await {
+                    let _ = songbird.leave(guild_id).await;
+                }
+                runtime.mark_voice_disconnected(&app, guild_id);
+                break;
+            }
+        });
+        self.runtime.set_voice_idle_monitor(guild_id, idle_monitor);
+
+        format!(
+            "Joined your voice channel. GPTVoice will leave automatically after {} minutes without speech to protect the ChatGPT Voice allowance. Use /join or the Join voice button to reconnect.",
+            VOICE_IDLE_TIMEOUT.as_secs() / 60
+        )
     }
 
     async fn leave_voice(&self, context: &Context, guild_id: Option<GuildId>) -> String {
@@ -1452,9 +1473,7 @@ impl Handler {
         if let Some(songbird) = songbird::get(context).await {
             let _ = songbird.leave(guild_id).await;
         }
-        if let Ok(mut guilds) = self.runtime.voice_guilds.lock() {
-            guilds.remove(&guild_id.get());
-        }
+        self.runtime.mark_voice_disconnected(&self.app, guild_id);
         let _ = self
             .browsers
             .stop_guild(&self.app, &guild_id.to_string())
@@ -1564,6 +1583,20 @@ pub fn stop_runtime(app: &AppHandle, runtime: &DiscordRuntime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_activity_requires_a_speaking_member_and_real_audio_energy() {
+        assert!(!has_voice_activity(0, 1_920, 1_000, 1_920));
+        assert!(!has_voice_activity(1, 0, 1_000, 1_920));
+        assert!(!has_voice_activity(1, 1_920, 37, 1_920));
+        assert!(has_voice_activity(1, 1_920, 38, 1_920));
+    }
+
+    #[test]
+    fn voice_idle_timeout_is_five_minutes() {
+        assert_eq!(VOICE_IDLE_TIMEOUT, Duration::from_secs(300));
+        assert_eq!(VOICE_IDLE_CHECK_INTERVAL, Duration::from_secs(10));
+    }
 
     #[test]
     fn member_panel_action_ids_are_server_scoped() {
