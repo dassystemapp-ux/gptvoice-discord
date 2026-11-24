@@ -1328,6 +1328,11 @@ impl Handler {
             return "Join a voice channel in the configured DAS server first, then press /join again.".to_owned();
         };
 
+        let config = match config::load_snapshot(&self.app) {
+            Ok(config) => config,
+            Err(error) => return format!("Could not load GPTVoice configuration: {error}"),
+        };
+
         // Confirm the existing Songbird connection and its actual channel.
         // If the member has moved, rebuild the relay for their new room.
         if let Some(existing_call) = songbird.get(guild_id) {
@@ -1335,9 +1340,20 @@ impl Handler {
                 let call = existing_call.lock().await;
                 (call.current_channel(), call.current_connection().is_some())
             };
-            if connected && current_channel == Some(channel_id.into()) {
+            let active_provider_matches = voice_provider_matches(
+                &config.voice_provider,
+                self.runtime.has_gemini_live_session(guild_id),
+            );
+            if connected && current_channel == Some(channel_id.into()) && active_provider_matches {
                 self.runtime.mark_voice_connected(&self.app, guild_id);
-                return "GPTVoice is already connected to this server's voice channel.".to_owned();
+                return format!(
+                    "GPTVoice is already connected using {}.",
+                    if config.voice_provider == "gemini-live" {
+                        "Gemini Live"
+                    } else {
+                        "ChatGPT Live Voice"
+                    }
+                );
             }
 
             if current_channel.is_some() && !connected {
@@ -1347,9 +1363,20 @@ impl Handler {
                 let call = existing_call.lock().await;
                 (call.current_channel(), call.current_connection().is_some())
             };
-            if connected && current_channel == Some(channel_id.into()) {
+            let active_provider_matches = voice_provider_matches(
+                &config.voice_provider,
+                self.runtime.has_gemini_live_session(guild_id),
+            );
+            if connected && current_channel == Some(channel_id.into()) && active_provider_matches {
                 self.runtime.mark_voice_connected(&self.app, guild_id);
-                return "GPTVoice is already connected to this server's voice channel.".to_owned();
+                return format!(
+                    "GPTVoice is already connected using {}.",
+                    if config.voice_provider == "gemini-live" {
+                        "Gemini Live"
+                    } else {
+                        "ChatGPT Live Voice"
+                    }
+                );
             }
 
             let moving = connected || current_channel.is_some();
@@ -1373,11 +1400,6 @@ impl Handler {
             };
             let _ = self.app.emit("runtime-log", message);
         }
-
-        let config = match config::load_snapshot(&self.app) {
-            Ok(config) => config,
-            Err(error) => return format!("Could not load GPTVoice configuration: {error}"),
-        };
 
         let (voice_transport, reader, pending_gemini_session) = match config.voice_provider.as_str()
         {
@@ -1705,6 +1727,14 @@ impl Handler {
     }
 }
 
+fn voice_provider_matches(configured_provider: &str, gemini_session_active: bool) -> bool {
+    match configured_provider {
+        "chatgpt" => !gemini_session_active,
+        "gemini-live" => gemini_session_active,
+        _ => false,
+    }
+}
+
 fn message_guild_matches(
     configured_guild: Option<GuildId>,
     message_guild: Option<GuildId>,
@@ -1818,6 +1848,15 @@ mod tests {
     fn voice_idle_timeout_is_five_minutes() {
         assert_eq!(VOICE_IDLE_TIMEOUT, Duration::from_secs(300));
         assert_eq!(VOICE_IDLE_CHECK_INTERVAL, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn selected_voice_provider_replaces_a_different_active_provider() {
+        assert!(voice_provider_matches("chatgpt", false));
+        assert!(!voice_provider_matches("chatgpt", true));
+        assert!(voice_provider_matches("gemini-live", true));
+        assert!(!voice_provider_matches("gemini-live", false));
+        assert!(!voice_provider_matches("unknown", false));
     }
 
     #[test]
