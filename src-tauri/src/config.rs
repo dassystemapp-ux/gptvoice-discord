@@ -18,6 +18,9 @@ pub struct ConfigSnapshot {
     pub browser_profile: String,
     pub discord_token_configured: bool,
     pub discord_token_masked: String,
+    pub gemini_api_key_configured: bool,
+    pub gemini_api_key_masked: String,
+    pub gemini_terms_accepted: bool,
     pub discord_guild_id: String,
     pub chatgpt_url: String,
     pub browser_executable: String,
@@ -35,6 +38,8 @@ pub struct ConfigSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct ConfigPatch {
     pub discord_token: Option<String>,
+    pub gemini_api_key: Option<String>,
+    pub gemini_terms_accepted: Option<bool>,
     pub discord_guild_id: Option<String>,
     pub chatgpt_url: Option<String>,
     pub browser_executable: Option<String>,
@@ -65,6 +70,23 @@ pub fn load_discord_credentials(app: &AppHandle) -> Result<(String, Option<Strin
     ))
 }
 
+pub fn load_gemini_api_key(app: &AppHandle) -> Result<String, String> {
+    let downloads_key = env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|profile| profile.join("Downloads").join("API GEMINI.txt"))
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|value| value.trim().trim_start_matches('\u{feff}').to_owned())
+        .filter(|value| !value.is_empty());
+    if let Some(key) = downloads_key {
+        return Ok(key);
+    }
+    let (_path, environment) = merged_environment(app)?;
+    let key = string_value(&environment, "GEMINI_API_KEY", "");
+    if key.is_empty() {
+        return Err("Gemini API key is not configured".to_owned());
+    }
+    Ok(key)
+}
 fn local_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     if cfg!(windows) {
         if let Some(path) = env::var_os("LOCALAPPDATA") {
@@ -268,6 +290,26 @@ fn snapshot_from_environment(path: &Path, environment: &Map<String, Value>) -> C
             default_browser_profile.to_string_lossy().as_ref(),
         ),
         discord_token_configured: !token.is_empty(),
+        gemini_api_key_configured: !string_value(environment, "GEMINI_API_KEY", "").is_empty()
+            || env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|profile| profile.join("Downloads").join("API GEMINI.txt").is_file())
+                .unwrap_or(false),
+        gemini_api_key_masked: if string_value(environment, "GEMINI_API_KEY", "").is_empty()
+            && !env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|profile| profile.join("Downloads").join("API GEMINI.txt").is_file())
+                .unwrap_or(false)
+        {
+            String::new()
+        } else {
+            MASKED_TOKEN.to_owned()
+        },
+        gemini_terms_accepted: bool_value(environment, "GEMINI_TERMS_ACCEPTED", false)
+            || env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|profile| profile.join("Downloads").join("API GEMINI.txt").is_file())
+                .unwrap_or(false),
         discord_token_masked: if token.is_empty() {
             String::new()
         } else {
@@ -353,6 +395,20 @@ pub fn save_patch(app: &AppHandle, patch: ConfigPatch) -> Result<ConfigSnapshot,
             );
         }
         environment.insert("DISCORD_TOKEN".to_owned(), Value::String(value));
+    }
+    if let Some(value) = patch.gemini_api_key {
+        let value = value.trim().to_owned();
+        if !value.is_empty() {
+            if value == "********" {
+                return Err(
+                    "Enter the complete Gemini API key, not a masked placeholder".to_owned(),
+                );
+            }
+            environment.insert("GEMINI_API_KEY".to_owned(), Value::String(value));
+        }
+    }
+    if let Some(value) = patch.gemini_terms_accepted {
+        environment.insert("GEMINI_TERMS_ACCEPTED".to_owned(), Value::Bool(value));
     }
     if let Some(value) = patch.discord_guild_id {
         environment.insert(

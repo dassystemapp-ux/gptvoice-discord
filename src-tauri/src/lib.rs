@@ -1,7 +1,9 @@
+mod ai;
 mod audio;
 mod browser;
 mod config;
 mod discord;
+mod study;
 
 use serde::{Deserialize, Serialize};
 use std::{

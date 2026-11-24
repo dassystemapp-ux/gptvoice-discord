@@ -928,10 +928,12 @@ impl BrowserSession {
                     const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
                     return text.length <= 180 && /enable microphone access in settings/i.test(text);
                   });
-                  const voiceControlVisible = controls.some((element, index) => visible(element) && /voice|microphone|mic/i.test(labels[index]) && !/settings|mute|unmute/i.test(labels[index]));
-                  const activeVoiceControl = controls.some((element, index) => visible(element) && /\b(?:end|stop|leave|exit|close|quit)\b.{0,32}\b(?:voice|call|conversation)\b|\b(?:voice|call|conversation)\b.{0,32}\b(?:end|stop|leave|exit|close|quit)\b/i.test(labels[index]));
-                  const activeMicrophoneControl = controls.some((element, index) => visible(element) && /\b(?:mute|unmute|turn off|turn on)(?: the)?\s+(?:microphone|mic)\b/i.test(labels[index]));
-                  const startVoiceControl = controls.some((element, index) => visible(element) && ( /\b(?:start|open|begin|talk to|use)\b.{0,24}\bvoice\b/i.test(labels[index]) || /^(?:voice|voice mode|talk to chatgpt)$/i.test(labels[index]) ) && !/settings|customize/i.test(labels[index]));
+                  const voiceStartSelector = '[data-composer-voice-start="true"],[data-testid="composer-voice-start"]';
+                  const voiceStartButtonVisible = [...document.querySelectorAll(voiceStartSelector)].some(visible);
+                  const voiceControlVisible = voiceStartButtonVisible || controls.some((element, index) => visible(element) && /voice|microphone|mic|صوت|ميكروفون|محادثة/i.test(labels[index]) && !/settings|mute|unmute|إعدادات|كتم/i.test(labels[index]));
+                  const activeVoiceControl = controls.some((element, index) => visible(element) && (/\b(?:end|stop|leave|exit|close|quit)\b.{0,32}\b(?:voice|call|conversation)\b|\b(?:voice|call|conversation)\b.{0,32}\b(?:end|stop|leave|exit|close|quit)\b/i.test(labels[index]) || /(?:إنهاء|إيقاف|مغادرة|خروج|إغلاق).{0,32}(?:الصوت|المحادثة)|(?:الصوت|المحادثة).{0,32}(?:إنهاء|إيقاف|مغادرة|خروج|إغلاق)/i.test(labels[index])));
+                  const activeMicrophoneControl = controls.some((element, index) => visible(element) && (/\b(?:mute|unmute|turn off|turn on)(?: the)?\s+(?:microphone|mic)\b/i.test(labels[index]) || /(?:كتم|إلغاء كتم|تشغيل|إيقاف).{0,24}(?:الميكروفون|الصوت)|(?:الميكروفون|الصوت).{0,24}(?:كتم|إلغاء كتم)/i.test(labels[index])));
+                  const startVoiceControl = voiceStartButtonVisible || controls.some((element, index) => visible(element) && ( /\b(?:start|open|begin|talk to|use)\b.{0,24}\bvoice\b/i.test(labels[index]) || /^(?:voice|voice mode|talk to chatgpt)$/i.test(labels[index]) || /(?:بدء|ابدأ|فتح|تشغيل).{0,24}(?:محادثة|وضع)?\s*(?:صوتية|الصوت)|^(?:صوت|محادثة صوتية)$/i.test(labels[index]) ) && !/settings|customize|إعدادات/i.test(labels[index]));
                   const voiceModeActive = activeVoiceControl || (activeMicrophoneControl && !startVoiceControl);
                   const surfaces = [...document.querySelectorAll('dialog[open],[role="dialog"],[aria-modal="true"],[data-state="open"]')].filter(visible);
                   const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -1382,6 +1384,66 @@ impl BrowserSession {
         self.start_voice().await
     }
 
+    async fn send_voice_prompt(&mut self, prompt: &str) -> Result<(), String> {
+        self.refresh_status().await?;
+        if !self.status.voice_mode_active {
+            return Err(
+                "ChatGPT Voice is not active; a voice greeting cannot be sent yet.".to_owned(),
+            );
+        }
+
+        let cdp = self
+            .cdp
+            .clone()
+            .ok_or_else(|| "Browser is not running".to_owned())?;
+        let prompt_json = serde_json::to_string(prompt)
+            .map_err(|error| format!("Could not encode the voice greeting: {error}"))?;
+        let expression = format!(
+            r#"(() => {{
+              const editor = [...document.querySelectorAll('[contenteditable="true"][role="textbox"]')]
+                .find((element) => {{
+                  const rect = element.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0 && !element.closest('[hidden]');
+                }});
+              if (!editor) return false;
+              editor.focus();
+              document.execCommand('insertText', false, {prompt_json});
+              return Boolean(editor.innerText.trim());
+            }})()"#
+        );
+        if cdp.evaluate(&expression).await? != Value::Bool(true) {
+            return Err(
+                "ChatGPT's message composer is not available for the voice greeting.".to_owned(),
+            );
+        }
+
+        cdp.call(
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyDown",
+                "key": "Enter",
+                "code": "Enter",
+                "windowsVirtualKeyCode": 13,
+                "nativeVirtualKeyCode": 13
+            }),
+        )
+        .await?;
+        cdp.call(
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyUp",
+                "key": "Enter",
+                "code": "Enter",
+                "windowsVirtualKeyCode": 13,
+                "nativeVirtualKeyCode": 13
+            }),
+        )
+        .await?;
+
+        sleep(Duration::from_millis(500)).await;
+        Ok(())
+    }
+
     async fn recent_threads(&mut self) -> Result<Vec<ThreadSummary>, String> {
         let cdp = self
             .cdp
@@ -1500,7 +1562,8 @@ impl BrowserSession {
                       const target = controls.find((element) => {
                         if (!visible(element)) return false;
                         const label = `${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''} ${element.textContent || ''}`.replace(/\s+/g, ' ').trim();
-                        return /voice|microphone/i.test(label) && !/end|stop|leave|exit|mute|unmute|settings|close|cancel|disable/i.test(label);
+                        const composerVoiceStart = element.matches('[data-composer-voice-start="true"],[data-testid="composer-voice-start"]');
+                        return composerVoiceStart || (/voice|microphone|mic|صوت|ميكروفون|محادثة/i.test(label) && !/end|stop|leave|exit|mute|unmute|settings|close|cancel|disable|إنهاء|إيقاف|مغادرة|خروج|كتم|إعدادات|إغلاق|تعطيل/i.test(label));
                       });
                       if (!target) return false;
                       const rect = target.getBoundingClientRect();
@@ -2517,6 +2580,18 @@ impl BrowserRuntime {
             }
         }
         Ok(session.status.clone())
+    }
+
+    pub async fn speak_text_guild(
+        &self,
+        app: &AppHandle,
+        guild_id: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        let config = config::load_snapshot(app)?;
+        let session = self.session(guild_id, &config)?;
+        let mut session = session.lock().await;
+        session.send_voice_prompt(prompt).await
     }
 
     pub async fn stop_guild(

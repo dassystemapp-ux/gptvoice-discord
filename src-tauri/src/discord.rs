@@ -4,7 +4,7 @@ use serenity::all::{
     async_trait, ButtonStyle, Command, ComponentInteraction, Context, CreateActionRow,
     CreateButton, CreateCommand, CreateEmbed, CreateInteractionResponse,
     CreateInteractionResponseMessage, EditInteractionResponse, EditMessage, EventHandler,
-    GatewayIntents, GuildId, Interaction, MessageId, Ready, UserId,
+    GatewayIntents, GuildId, Interaction, Message, MessageId, Ready, UserId, VoiceState,
 };
 use serenity::gateway::ShardManager;
 use serenity::http::Http;
@@ -17,7 +17,10 @@ use songbird::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tauri::{AppHandle, Emitter, State};
@@ -52,6 +55,7 @@ pub struct DiscordRuntime {
     shard_manager: Arc<Mutex<Option<Arc<ShardManager>>>>,
     status: Arc<Mutex<DiscordStatus>>,
     voice_guilds: Arc<Mutex<HashSet<u64>>>,
+    voice_joining: Arc<Mutex<HashSet<u64>>>,
     member_panels: Arc<Mutex<HashMap<u64, (serenity::all::ChannelId, MessageId)>>>,
     member_panel_monitor: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     http: Arc<Mutex<Option<Arc<Http>>>>,
@@ -121,6 +125,33 @@ impl DiscordRuntime {
             .lock()
             .map(|guilds| guilds.contains(&guild_id.get()))
             .unwrap_or(false)
+    }
+
+    fn begin_voice_join(&self, guild_id: GuildId) -> bool {
+        self.voice_joining
+            .lock()
+            .map(|mut guilds| guilds.insert(guild_id.get()))
+            .unwrap_or(false)
+    }
+
+    fn finish_voice_join(&self, guild_id: GuildId) {
+        if let Ok(mut guilds) = self.voice_joining.lock() {
+            guilds.remove(&guild_id.get());
+        }
+    }
+
+    fn mark_voice_connected(&self, app: &AppHandle, guild_id: GuildId) {
+        if let Ok(mut guilds) = self.voice_guilds.lock() {
+            guilds.insert(guild_id.get());
+        }
+        self.emit_status(app);
+    }
+
+    fn mark_voice_disconnected(&self, app: &AppHandle, guild_id: GuildId) {
+        if let Ok(mut guilds) = self.voice_guilds.lock() {
+            guilds.remove(&guild_id.get());
+        }
+        self.emit_status(app);
     }
 
     fn start_member_panel_monitor(&self, app: &AppHandle, browsers: browser::BrowserRuntime) {
@@ -320,10 +351,48 @@ struct Handler {
     runtime: DiscordRuntime,
     browsers: browser::BrowserRuntime,
     guild_id: Option<GuildId>,
+    study: crate::study::StudyRuntime,
 }
 
 struct ReceiveToBrowser {
     media: Arc<BrowserMediaTransport>,
+    app: AppHandle,
+    guild_id: GuildId,
+    ticks: AtomicU64,
+}
+
+struct VoiceJoinAttemptGuard {
+    runtime: DiscordRuntime,
+    guild_id: GuildId,
+}
+
+impl Drop for VoiceJoinAttemptGuard {
+    fn drop(&mut self) {
+        self.runtime.finish_voice_join(self.guild_id);
+    }
+}
+
+struct VoiceConnectionMonitor {
+    runtime: DiscordRuntime,
+    app: AppHandle,
+    guild_id: GuildId,
+}
+
+#[async_trait]
+impl songbird::EventHandler for VoiceConnectionMonitor {
+    async fn act(&self, context: &EventContext<'_>) -> Option<songbird::Event> {
+        if matches!(context, EventContext::DriverDisconnect(_)) {
+            self.runtime
+                .mark_voice_disconnected(&self.app, self.guild_id);
+            let message = format!(
+                "[discord:{}] Voice driver disconnected; the bot is ready to rejoin.",
+                self.guild_id.get()
+            );
+            log::warn!("{message}");
+            let _ = self.app.emit("runtime-log", message);
+        }
+        None
+    }
 }
 
 struct RelayTrackEventLogger {
@@ -585,6 +654,8 @@ impl songbird::EventHandler for ReceiveToBrowser {
         let EventContext::VoiceTick(tick) = context else {
             return None;
         };
+        let tick_number = self.ticks.fetch_add(1, Ordering::Relaxed) + 1;
+        let speaking_users = tick.speaking.len();
         let frame_len = tick
             .speaking
             .values()
@@ -593,10 +664,17 @@ impl songbird::EventHandler for ReceiveToBrowser {
             .unwrap_or(1_920);
         let mut mixed = vec![0_i16; frame_len];
         let mut counts = vec![0_u32; frame_len];
+        let mut decoded_samples = 0_u64;
+        let mut non_silent_samples = 0_u64;
         for voice in tick.speaking.values() {
             let Some(samples) = voice.decoded_voice.as_ref() else {
                 continue;
             };
+            decoded_samples += samples.len() as u64;
+            non_silent_samples += samples
+                .iter()
+                .filter(|sample| (**sample as i32).abs() >= 350)
+                .count() as u64;
             for (index, sample) in samples.iter().copied().enumerate().take(frame_len) {
                 mixed[index] = mixed[index].saturating_add(sample);
                 counts[index] += 1;
@@ -607,7 +685,16 @@ impl songbird::EventHandler for ReceiveToBrowser {
                 *sample = (*sample as i32 / count as i32) as i16;
             }
         }
-        let _ = self.media.send_pcm_i16(&mixed);
+        let queued = self.media.send_pcm_i16(&mixed);
+        if tick_number == 1 || tick_number % 250 == 0 {
+            let message = format!(
+                "[discord:{}] VoiceTick #{tick_number}: speaking_users={speaking_users}, decoded_samples={decoded_samples}, non_silent_samples={non_silent_samples}, media_connected={}, queued={queued}",
+                self.guild_id.get(),
+                self.media.is_connected(),
+            );
+            log::info!("{message}");
+            let _ = self.app.emit("runtime-log", message);
+        }
         None
     }
 }
@@ -617,6 +704,8 @@ fn command_definitions() -> Vec<CreateCommand> {
         CreateCommand::new("join").description("Join your current Discord voice channel"),
         CreateCommand::new("leave").description("Leave the current Discord voice channel"),
         CreateCommand::new("status").description("Show GPTVoice status"),
+        CreateCommand::new("study").description("Open DAS student learning tools"),
+        CreateCommand::new("studyboard").description("Show DAS points and the student leaderboard"),
     ]
 }
 
@@ -628,6 +717,7 @@ impl EventHandler for Handler {
         }
         self.runtime
             .start_member_panel_monitor(&self.app, self.browsers.clone());
+        self.study.start_timer_monitor(context.http.clone());
         let mut status = self.runtime.status();
         status.state = "connected".to_owned();
         status.connected = true;
@@ -678,6 +768,201 @@ impl EventHandler for Handler {
                 );
             }
         }
+
+        // Recovery/testing convenience: if the configured guild has exactly one
+        // occupied human voice channel when the bot starts, rejoin that channel.
+        // Never guess when members are spread across multiple voice channels.
+        if let Some(guild_id) = self.guild_id {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let active_voice_states = context
+                .cache
+                .guild(guild_id)
+                .map(|guild| {
+                    guild
+                        .voice_states
+                        .iter()
+                        .filter_map(|(user_id, state)| {
+                            if *user_id == ready.user.id {
+                                return None;
+                            }
+                            state.channel_id.map(|channel_id| (*user_id, channel_id))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let active_channels = active_voice_states
+                .iter()
+                .map(|(_, channel_id)| *channel_id)
+                .collect::<HashSet<_>>();
+            if active_channels.len() == 1 {
+                if let Some((user_id, _)) = active_voice_states.first() {
+                    let _ = self.app.emit(
+                        "runtime-log",
+                        format!(
+                            "[auto-join] Exactly one occupied voice channel detected in guild {}.",
+                            guild_id.get()
+                        ),
+                    );
+                    let result = self.join_voice(&context, Some(guild_id), *user_id).await;
+                    let _ = self
+                        .app
+                        .emit("runtime-log", format!("[auto-join] {result}"));
+                }
+            } else {
+                let _ = self.app.emit(
+                    "runtime-log",
+                    format!(
+                        "[auto-join] Skipped: found {} occupied voice channel(s); no channel was selected.",
+                        active_channels.len()
+                    ),
+                );
+            }
+        }
+    }
+
+    async fn voice_state_update(&self, context: Context, old: Option<VoiceState>, new: VoiceState) {
+        let Some(guild_id) = new.guild_id else {
+            return;
+        };
+        if self.guild_id != Some(guild_id) {
+            return;
+        }
+
+        let bot_user_id = context.cache.current_user().id;
+        if new.user_id == bot_user_id {
+            if new.channel_id.is_some() {
+                self.runtime.mark_voice_connected(&self.app, guild_id);
+            } else {
+                self.runtime.mark_voice_disconnected(&self.app, guild_id);
+            }
+            return;
+        }
+
+        let previous_channel = old.and_then(|state| state.channel_id);
+        let current_channel = new.channel_id;
+        if previous_channel == current_channel {
+            return;
+        }
+
+        // Let Discord's voice-state cache settle before deciding whether the old
+        // room is empty or joining the member's new room.
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let active_voice_states = context
+            .cache
+            .guild(guild_id)
+            .map(|guild| {
+                guild
+                    .voice_states
+                    .iter()
+                    .filter_map(|(user_id, state)| {
+                        if *user_id == bot_user_id {
+                            return None;
+                        }
+                        state.channel_id.map(|channel_id| (*user_id, channel_id))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // Inspect the bot's actual voice channel instead of relying only on the
+        // member's cached previous state. Discord can omit the old state during
+        // reconnects; the actual channel is the source of truth for auto-leave.
+        let bot_channel = if let Some(songbird) = songbird::get(&context).await {
+            if let Some(call) = songbird.get(guild_id) {
+                let call = call.lock().await;
+                call.current_channel()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(bot_channel) = bot_channel {
+            let humans_remain = active_voice_states
+                .iter()
+                .any(|(_, channel_id)| channel_id.get() == bot_channel.0.get());
+            if !humans_remain {
+                let _ = self.app.emit(
+                    "runtime-log",
+                    format!(
+                        "[auto-leave] No human members remain in voice channel {}; leaving.",
+                        bot_channel.0.get()
+                    ),
+                );
+                let result = self.leave_voice(&context, Some(guild_id)).await;
+                let _ = self
+                    .app
+                    .emit("runtime-log", format!("[auto-leave] {result}"));
+            }
+        }
+
+        // Follow the exact channel the member entered. If another voice-state
+        // event is already joining, retry briefly instead of silently missing
+        // this move. join_voice reads the member's latest cached channel each time.
+        if let Some(target_channel) = current_channel {
+            let _ = self.app.emit(
+                "runtime-log",
+                format!(
+                    "[auto-join] Member {} entered voice channel {}; following them.",
+                    new.user_id.get(),
+                    target_channel.get()
+                ),
+            );
+
+            let mut result = String::new();
+            for attempt in 1..=10 {
+                result = self.join_voice(&context, Some(guild_id), new.user_id).await;
+                if !result.contains("already attempting to connect") {
+                    break;
+                }
+                let _ = self.app.emit(
+                    "runtime-log",
+                    format!(
+                        "[auto-join] Join is busy; retrying after a short delay ({attempt}/10)."
+                    ),
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            let joined = result.starts_with("Joined your voice channel")
+                || result.contains("already connected to this server's voice channel");
+            let _ = self
+                .app
+                .emit("runtime-log", format!("[auto-join] {result}"));
+
+            if joined {
+                let prompt = "You are DAS Bot, the friendly voice assistant for DAS. Greet the new member in a natural Saudi Arabic voice. Say exactly: \u{64a}\u{627}\u{20}\u{647}\u{644}\u{627}\u{20}\u{641}\u{64a}\u{643}\u{60c}\u{20}\u{62d}\u{64a}\u{651}\u{627}\u{643}\u{20}\u{627}\u{644}\u{644}\u{647}\u{20}\u{645}\u{639}\u{646}\u{627}\u{20}\u{641}\u{64a}\u{20}\u{631}\u{648}\u{645}\u{20}\u{44}\u{41}\u{53}. Do not mention any name or prior conversation.";
+                match self
+                    .browsers
+                    .speak_text_guild(&self.app, &guild_id.get().to_string(), prompt)
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = self.app.emit(
+                            "runtime-log",
+                            "[greeting] Sent a short Arabic voice greeting for the new member.",
+                        );
+                    }
+                    Err(error) => {
+                        let _ = self.app.emit(
+                            "runtime-log",
+                            format!("[greeting] Could not start the voice greeting: {error}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    async fn message(&self, context: Context, new_message: Message) {
+        // If a guild is configured, scope messages to it. When the optional
+        // guild setting is empty, the study module still filters to known DAS rooms.
+        if !message_guild_matches(self.guild_id, new_message.guild_id) {
+            return;
+        }
+        let bot_id = context.cache.current_user().id;
+        crate::study::handle_message(&self.app, &self.study, &context, &new_message, bot_id).await;
     }
 
     async fn interaction_create(&self, context: Context, interaction: Interaction) {
@@ -729,6 +1014,31 @@ impl EventHandler for Handler {
                         .edit_response(&context, EditInteractionResponse::new().content(reply))
                         .await;
                 }
+                "studyboard" => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .embed(self.study.leaderboard_embed())
+                            .ephemeral(true),
+                    );
+                    if let Err(error) = command.create_response(&context, response).await {
+                        let _ = self
+                            .app
+                            .emit("runtime-log", format!("DAS leaderboard failed: {error}"));
+                    }
+                }
+                "study" => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .embed(crate::study::menu_embed())
+                            .components(crate::study::menu_components())
+                            .ephemeral(true),
+                    );
+                    if let Err(error) = command.create_response(&context, response).await {
+                        let _ = self
+                            .app
+                            .emit("runtime-log", format!("DAS study menu failed: {error}"));
+                    }
+                }
                 "status" => {
                     let content = if self.runtime.status().connected {
                         "GPTVoice is connected to Discord."
@@ -750,6 +1060,11 @@ impl EventHandler for Handler {
                 _ => {}
             },
             Interaction::Component(component) => {
+                if crate::study::handle_component(&self.app, &self.study, &context, &component)
+                    .await
+                {
+                    return;
+                }
                 let Some((_, panel_guild_id)) =
                     parse_member_panel_action(&component.data.custom_id)
                 else {
@@ -905,15 +1220,17 @@ impl Handler {
         let Some(guild_id) = guild_id else {
             return "Use this control inside a Discord server.".to_owned();
         };
-        if self
-            .runtime
-            .voice_guilds
-            .lock()
-            .map(|guilds| guilds.contains(&guild_id.get()))
-            .unwrap_or(false)
-        {
-            return "GPTVoice is already connected to this server's voice channel.".to_owned();
+        let Some(songbird) = songbird::get(context).await else {
+            return "The Discord voice driver is not available yet.".to_owned();
+        };
+        if !self.runtime.begin_voice_join(guild_id) {
+            return "GPTVoice is already attempting to connect to this voice channel. Try again in a moment.".to_owned();
         }
+        let _join_attempt = VoiceJoinAttemptGuard {
+            runtime: self.runtime.clone(),
+            guild_id,
+        };
+
         let channel_id = context.cache.guild(guild_id).and_then(|guild| {
             guild
                 .voice_states
@@ -921,100 +1238,211 @@ impl Handler {
                 .and_then(|state| state.channel_id)
         });
         let Some(channel_id) = channel_id else {
-            return "Join a voice channel first, then press /join again.".to_owned();
+            return "Join a voice channel in the configured DAS server first, then press /join again.".to_owned();
         };
-        let Some(songbird) = songbird::get(context).await else {
-            return "The Discord voice driver is not available yet.".to_owned();
-        };
-        if let Err(error) = songbird.join(guild_id, channel_id).await {
-            return format!("I could not join that voice channel: {error}");
+
+        // Confirm the existing Songbird connection and its actual channel.
+        // If the member has moved, rebuild the relay for their new room.
+        if let Some(existing_call) = songbird.get(guild_id) {
+            let (current_channel, connected) = {
+                let call = existing_call.lock().await;
+                (call.current_channel(), call.current_connection().is_some())
+            };
+            if connected && current_channel == Some(channel_id.into()) {
+                self.runtime.mark_voice_connected(&self.app, guild_id);
+                return "GPTVoice is already connected to this server's voice channel.".to_owned();
+            }
+
+            if current_channel.is_some() && !connected {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+            let (current_channel, connected) = {
+                let call = existing_call.lock().await;
+                (call.current_channel(), call.current_connection().is_some())
+            };
+            if connected && current_channel == Some(channel_id.into()) {
+                self.runtime.mark_voice_connected(&self.app, guild_id);
+                return "GPTVoice is already connected to this server's voice channel.".to_owned();
+            }
+
+            let moving = connected || current_channel.is_some();
+            if moving {
+                let _ = songbird.leave(guild_id).await;
+            } else {
+                let _ = songbird.remove(guild_id).await;
+            }
+            self.runtime.mark_voice_disconnected(&self.app, guild_id);
+            let _ = self
+                .browsers
+                .stop_guild(&self.app, &guild_id.to_string())
+                .await;
+            let message = if moving {
+                format!(
+                    "[auto-join] Moving the bot to the member's new voice channel {}.",
+                    channel_id.get()
+                )
+            } else {
+                "[discord] Cleared a stale Songbird voice session before retrying /join.".to_owned()
+            };
+            let _ = self.app.emit("runtime-log", message);
         }
-        match self
+
+        let browser = match self
             .browsers
             .start_guild(&self.app, &guild_id.to_string())
             .await
         {
-            Ok(browser) if browser.logged_in => {
-                let media = match self
-                    .browsers
-                    .media_for_guild(&self.app, &guild_id.to_string())
-                    .await
-                {
-                    Ok(media) => media,
-                    Err(error) => {
-                        let _ = songbird.leave(guild_id).await;
-                        return format!("I could not start the browser audio transport: {error}");
-                    }
-                };
-                let reader = match self
-                    .browsers
-                    .take_media_reader(&self.app, &guild_id.to_string())
-                    .await
-                {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        let _ = songbird.leave(guild_id).await;
-                        return format!("I could not attach ChatGPT audio to Discord: {error}");
-                    }
-                };
-                let Some(call) = songbird.get(guild_id) else {
-                    let _ = songbird.leave(guild_id).await;
-                    return "Discord did not keep the voice connection open.".to_owned();
-                };
-                {
-                    let mut call = call.lock().await;
-                    call.add_global_event(CoreEvent::VoiceTick.into(), ReceiveToBrowser { media });
-                    let output_track = Track::from(RawAdapter::new(
-                        reader,
-                        crate::audio::PCM_SAMPLE_RATE,
-                        crate::audio::PCM_CHANNELS,
-                    ));
-                    let output_handle = call.play_only(output_track);
-                    for (event, event_name) in [
-                        (TrackEvent::Playable, "ready"),
-                        (TrackEvent::Error, "error"),
-                        (TrackEvent::End, "ended"),
-                    ] {
-                        if let Err(error) = output_handle.add_event(
-                            Event::Track(event),
-                            RelayTrackEventLogger {
-                                app: self.app.clone(),
-                                guild_id,
-                                event_name,
-                            },
-                        ) {
-                            log::warn!(
-                                "Could not attach Discord output track diagnostics for guild {}: {error}",
-                                guild_id.get()
-                            );
-                        }
-                    }
-                }
-                if let Ok(mut guilds) = self.runtime.voice_guilds.lock() {
-                    guilds.insert(guild_id.get());
-                }
-                let _ = self.app.emit(
-                    "runtime-log",
-                    format!(
-                        "Joined Discord voice and opened ChatGPT for guild {}.",
-                        guild_id.get()
-                    ),
-                );
-                "Joined your voice channel and connected the continuous audio relay. The administrator can control ChatGPT from the GPTVoice desktop Status panel.".to_owned()
+            Ok(browser) => browser,
+            Err(error) => {
+                return format!("I could not start the dedicated ChatGPT browser: {error}");
             }
-            Ok(_) => {
-                let _ = songbird.leave(guild_id).await;
+        };
+        if !browser.logged_in {
+            let _ = self
+                .browsers
+                .stop_guild(&self.app, &guild_id.to_string())
+                .await;
+            return "The dedicated ChatGPT profile needs sign-in. Complete the browser setup, then press /join again.".to_owned();
+        }
+
+        let media = match self
+            .browsers
+            .media_for_guild(&self.app, &guild_id.to_string())
+            .await
+        {
+            Ok(media) => media,
+            Err(error) => {
                 let _ = self
                     .browsers
                     .stop_guild(&self.app, &guild_id.to_string())
                     .await;
-                "The dedicated ChatGPT profile needs sign-in. Complete the browser setup, then press /join again.".to_owned()
+                return format!("I could not start the browser audio transport: {error}");
             }
+        };
+        let reader = match self
+            .browsers
+            .take_media_reader(&self.app, &guild_id.to_string())
+            .await
+        {
+            Ok(reader) => reader,
             Err(error) => {
-                let _ = songbird.leave(guild_id).await;
-                format!("I could not start the dedicated ChatGPT browser: {error}")
+                let _ = self
+                    .browsers
+                    .stop_guild(&self.app, &guild_id.to_string())
+                    .await;
+                return format!("I could not attach ChatGPT audio to Discord: {error}");
+            }
+        };
+
+        // Songbird can emit receive events during the voice join handshake.
+        // Install VoiceTick before join, otherwise early user audio can be missed.
+        let call = songbird.get_or_insert(guild_id);
+        {
+            let mut call = call.lock().await;
+            call.add_global_event(
+                CoreEvent::DriverDisconnect.into(),
+                VoiceConnectionMonitor {
+                    runtime: self.runtime.clone(),
+                    app: self.app.clone(),
+                    guild_id,
+                },
+            );
+            call.add_global_event(
+                CoreEvent::VoiceTick.into(),
+                ReceiveToBrowser {
+                    media: Arc::clone(&media),
+                    app: self.app.clone(),
+                    guild_id,
+                    ticks: AtomicU64::new(0),
+                },
+            );
+        }
+
+        if let Err(error) = songbird.join(guild_id, channel_id).await {
+            let _ = songbird.remove(guild_id).await;
+            let _ = self
+                .browsers
+                .stop_guild(&self.app, &guild_id.to_string())
+                .await;
+            return format!("I could not join that voice channel: {error}");
+        }
+
+        // Start the Discord playback track only after the call has joined.
+        {
+            let mut call = call.lock().await;
+            let output_track = Track::from(RawAdapter::new(
+                reader,
+                crate::audio::PCM_SAMPLE_RATE,
+                crate::audio::PCM_CHANNELS,
+            ));
+            let output_handle = call.play_only(output_track);
+            for (event, event_name) in [
+                (TrackEvent::Playable, "ready"),
+                (TrackEvent::Error, "error"),
+                (TrackEvent::End, "ended"),
+            ] {
+                if let Err(error) = output_handle.add_event(
+                    Event::Track(event),
+                    RelayTrackEventLogger {
+                        app: self.app.clone(),
+                        guild_id,
+                        event_name,
+                    },
+                ) {
+                    log::warn!(
+                        "Could not attach Discord output track diagnostics for guild {}: {error}",
+                        guild_id.get()
+                    );
+                }
             }
         }
+        self.runtime.mark_voice_connected(&self.app, guild_id);
+        let _ = self.app.emit(
+            "runtime-log",
+            format!(
+                "Joined Discord voice and opened ChatGPT for guild {}.",
+                guild_id.get()
+            ),
+        );
+
+        // Starting the Discord relay only opens the dedicated ChatGPT page.
+        // Explicitly activate ChatGPT Voice after the Discord connection is ready
+        // so a fresh launch or automatic rejoin is immediately conversational.
+        match self
+            .browsers
+            .reconnect_voice_guild(&self.app, &guild_id.get().to_string())
+            .await
+        {
+            Ok(status) if status.voice_mode_active => {
+                let _ = self.app.emit(
+                    "runtime-log",
+                    format!(
+                        "[voice:{}] ChatGPT Voice is active after joining Discord.",
+                        guild_id.get()
+                    ),
+                );
+            }
+            Ok(_) => {
+                let _ = self.app.emit(
+                    "runtime-log",
+                    format!(
+                        "[voice:{}] Discord relay is ready, but ChatGPT Voice did not become active.",
+                        guild_id.get()
+                    ),
+                );
+            }
+            Err(error) => {
+                let _ = self.app.emit(
+                    "runtime-log",
+                    format!(
+                        "[voice:{}] Could not auto-start ChatGPT Voice after joining Discord: {error}",
+                        guild_id.get()
+                    ),
+                );
+            }
+        }
+
+        "Joined your voice channel, connected the continuous audio relay, and attempted to start ChatGPT Voice automatically. The administrator can control ChatGPT from the GPTVoice desktop Status panel.".to_owned()
     }
 
     async fn leave_voice(&self, context: &Context, guild_id: Option<GuildId>) -> String {
@@ -1033,6 +1461,21 @@ impl Handler {
             .await;
         "Left the Discord voice channel and stopped this guild's ChatGPT browser session."
             .to_owned()
+    }
+}
+
+fn message_guild_matches(
+    configured_guild: Option<GuildId>,
+    message_guild: Option<GuildId>,
+) -> bool {
+    configured_guild.map_or(true, |required| message_guild == Some(required))
+}
+
+fn discord_connection_error_message(error: &str) -> String {
+    if error.contains("DisallowedIntents") {
+        "Discord رفض اتصال البوت بسبب صلاحيات Gateway المميزة. افتح Discord Developer Portal ثم Application > Bot > Privileged Gateway Intents، وفعّل Message Content Intent، ثم احفظ الإعداد وأعد تشغيل DAS Bot.".to_owned()
+    } else {
+        format!("Discord connection stopped: {error}")
     }
 }
 
@@ -1068,12 +1511,16 @@ pub async fn start_runtime(
         let app_for_task = app.clone();
         let runtime_for_task = runtime.clone();
         let task_handle = tauri::async_runtime::spawn(async move {
-            let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+            let intents = GatewayIntents::GUILDS
+                | GatewayIntents::GUILD_VOICE_STATES
+                | GatewayIntents::GUILD_MESSAGES
+                | GatewayIntents::MESSAGE_CONTENT;
             let handler = Handler {
                 app: app_for_task.clone(),
                 runtime: runtime_for_task.clone(),
                 browsers,
                 guild_id: parsed_guild_id,
+                study: crate::study::StudyRuntime::new(&app_for_task),
             };
             let songbird_config = songbird::Config::default().decode_mode(
                 songbird::driver::DecodeMode::Decode(songbird::driver::DecodeConfig::default()),
@@ -1094,10 +1541,9 @@ pub async fn start_runtime(
                 *shard_manager = Some(client.shard_manager.clone());
             }
             if let Err(error) = client.start().await {
-                runtime_for_task.set_error(
-                    &app_for_task,
-                    format!("Discord connection stopped: {error}"),
-                );
+                let error_text = error.to_string();
+                let message = discord_connection_error_message(&error_text);
+                runtime_for_task.set_error(&app_for_task, message);
             } else {
                 runtime_for_task.set_state(&app_for_task, "stopped");
             }
@@ -1183,5 +1629,34 @@ mod tests {
         assert_eq!(fields[1]["value"], "spruce — Calm and affirming");
         assert_eq!(fields[2]["value"], "Instant");
         assert_eq!(fields[3]["value"], "Arabic");
+    }
+}
+
+#[cfg(test)]
+mod gateway_error_tests {
+    use super::{discord_connection_error_message, message_guild_matches};
+    use serenity::all::GuildId;
+
+    #[test]
+    fn explains_disallowed_message_content_intent() {
+        let message = discord_connection_error_message("Gateway error: DisallowedIntents");
+        assert!(message.contains("Message Content Intent"));
+        assert!(message.contains("Developer Portal"));
+    }
+
+    #[test]
+    fn preserves_other_discord_errors() {
+        let message = discord_connection_error_message("connection timed out");
+        assert!(message.contains("connection timed out"));
+    }
+
+    #[test]
+    fn optional_guild_filter_behaves_safely() {
+        let configured = GuildId::new(100);
+        let other = GuildId::new(200);
+        assert!(message_guild_matches(Some(configured), Some(configured)));
+        assert!(!message_guild_matches(Some(configured), Some(other)));
+        assert!(message_guild_matches(None, Some(other)));
+        assert!(!message_guild_matches(Some(configured), None));
     }
 }
