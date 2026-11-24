@@ -1268,6 +1268,7 @@ impl Handler {
             MemberPanelAction::Reconnect => {
                 let config = config::load_snapshot(&self.app)?;
                 if config.voice_provider == "gemini-live" {
+                    let _ = self.leave_voice(context, Some(guild_id)).await;
                     self.join_voice(context, Some(guild_id), component.user.id)
                         .await
                 } else {
