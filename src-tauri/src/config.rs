@@ -21,6 +21,8 @@ pub struct ConfigSnapshot {
     pub gemini_api_key_configured: bool,
     pub gemini_api_key_masked: String,
     pub gemini_terms_accepted: bool,
+    pub gemini_live_terms_accepted: bool,
+    pub voice_provider: String,
     pub discord_guild_id: String,
     pub chatgpt_url: String,
     pub browser_executable: String,
@@ -40,6 +42,8 @@ pub struct ConfigPatch {
     pub discord_token: Option<String>,
     pub gemini_api_key: Option<String>,
     pub gemini_terms_accepted: Option<bool>,
+    pub gemini_live_terms_accepted: Option<bool>,
+    pub voice_provider: Option<String>,
     pub discord_guild_id: Option<String>,
     pub chatgpt_url: Option<String>,
     pub browser_executable: Option<String>,
@@ -177,6 +181,11 @@ fn validate_environment(environment: &Map<String, Value>) -> Result<(), String> 
         return Err("ChatGPT URL must be an http(s) URL without spaces".to_owned());
     }
 
+    let voice_provider = string_value(environment, "VOICE_PROVIDER", "chatgpt").to_lowercase();
+    if !matches!(voice_provider.as_str(), "chatgpt" | "gemini-live") {
+        return Err("Voice provider must be chatgpt or gemini-live".to_owned());
+    }
+
     let mode = string_value(environment, "AUDIO_CAPTURE_MODE", "browser-media").to_lowercase();
     if !matches!(
         mode.as_str(),
@@ -235,6 +244,11 @@ fn default_environment(data_dir: &Path) -> Map<String, Value> {
         "CHATGPT_BROWSER_HIDE_WHEN_READY".to_owned(),
         Value::String("true".to_owned()),
     );
+    environment.insert(
+        "VOICE_PROVIDER".to_owned(),
+        Value::String("chatgpt".to_owned()),
+    );
+    environment.insert("GEMINI_LIVE_TERMS_ACCEPTED".to_owned(), Value::Bool(false));
     environment.insert(
         "AUDIO_CAPTURE_MODE".to_owned(),
         Value::String("browser-media".to_owned()),
@@ -310,6 +324,8 @@ fn snapshot_from_environment(path: &Path, environment: &Map<String, Value>) -> C
                 .map(PathBuf::from)
                 .map(|profile| profile.join("Downloads").join("API GEMINI.txt").is_file())
                 .unwrap_or(false),
+        gemini_live_terms_accepted: bool_value(environment, "GEMINI_LIVE_TERMS_ACCEPTED", false),
+        voice_provider: string_value(environment, "VOICE_PROVIDER", "chatgpt"),
         discord_token_masked: if token.is_empty() {
             String::new()
         } else {
@@ -409,6 +425,16 @@ pub fn save_patch(app: &AppHandle, patch: ConfigPatch) -> Result<ConfigSnapshot,
     }
     if let Some(value) = patch.gemini_terms_accepted {
         environment.insert("GEMINI_TERMS_ACCEPTED".to_owned(), Value::Bool(value));
+    }
+    if let Some(value) = patch.gemini_live_terms_accepted {
+        environment.insert("GEMINI_LIVE_TERMS_ACCEPTED".to_owned(), Value::Bool(value));
+    }
+    if let Some(value) = patch.voice_provider {
+        let provider = value.trim().to_lowercase();
+        if !matches!(provider.as_str(), "chatgpt" | "gemini-live") {
+            return Err("Voice provider must be chatgpt or gemini-live".to_owned());
+        }
+        environment.insert("VOICE_PROVIDER".to_owned(), Value::String(provider));
     }
     if let Some(value) = patch.discord_guild_id {
         environment.insert(
@@ -513,6 +539,16 @@ mod tests {
         environment.insert(
             "AUDIO_CAPTURE_MODE".to_owned(),
             Value::String("invalid".to_owned()),
+        );
+        assert!(validate_environment(&environment).is_err());
+
+        environment.insert(
+            "AUDIO_CAPTURE_MODE".to_owned(),
+            Value::String("browser-media".to_owned()),
+        );
+        environment.insert(
+            "VOICE_PROVIDER".to_owned(),
+            Value::String("other".to_owned()),
         );
         assert!(validate_environment(&environment).is_err());
     }
