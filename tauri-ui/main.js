@@ -88,6 +88,8 @@ function populateConfig(config) {
   state.config = config;
   $("config-guild-id").value = config.discordGuildId || "";
   $("config-gemini-terms").checked = config.geminiTermsAccepted === true;
+  $("config-gemini-live-terms").checked = config.geminiLiveTermsAccepted === true;
+  $("config-voice-provider").value = config.voiceProvider || "chatgpt";
   text("config-gemini-status", config.geminiApiKeyConfigured ? "Gemini key detected in Downloads (masked)." : "Gemini is not configured.");
   $("config-chatgpt-url").value = config.chatgptUrl || "";
   $("config-browser-executable").value = config.browserExecutable || "";
@@ -105,6 +107,8 @@ function populateConfig(config) {
     discordGuildId: config.discordGuildId,
     geminiApiKey: config.geminiApiKeyConfigured ? config.geminiApiKeyMasked : "not configured",
     geminiTermsAccepted: config.geminiTermsAccepted,
+    geminiLiveTermsAccepted: config.geminiLiveTermsAccepted,
+    voiceProvider: config.voiceProvider,
     chatgptUrl: config.chatgptUrl,
     browserProfile: config.browserProfile,
     browserExecutable: config.browserExecutable || "automatic",
@@ -437,6 +441,8 @@ async function saveConfig({ quiet = false } = {}) {
     discordToken: token || null,
     geminiApiKey: $("config-gemini-key").value.trim() || null,
     geminiTermsAccepted: $("config-gemini-terms").checked,
+    geminiLiveTermsAccepted: $("config-gemini-live-terms").checked,
+    voiceProvider: $("config-voice-provider").value,
     discordGuildId: $("config-guild-id").value.trim(),
     chatgptUrl: $("config-chatgpt-url").value.trim(),
     browserExecutable: $("config-browser-executable").value.trim(),

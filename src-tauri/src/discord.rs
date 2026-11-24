@@ -1,4 +1,8 @@
-use crate::{audio::BrowserMediaTransport, browser, config};
+use crate::{
+    ai::gemini_live::GeminiLiveVoiceSession,
+    audio::{BrowserMediaTransport, DirectPcmTransport},
+    browser, config,
+};
 use serde::Serialize;
 use serenity::all::{
     async_trait, ButtonStyle, Command, ComponentInteraction, Context, CreateActionRow,
@@ -63,6 +67,7 @@ pub struct DiscordRuntime {
     member_panels: Arc<Mutex<HashMap<u64, (serenity::all::ChannelId, MessageId)>>>,
     member_panel_monitor: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     http: Arc<Mutex<Option<Arc<Http>>>>,
+    gemini_live_sessions: Arc<Mutex<HashMap<u64, GeminiLiveVoiceSession>>>,
 }
 
 impl DiscordRuntime {
@@ -152,6 +157,7 @@ impl DiscordRuntime {
     }
 
     fn mark_voice_disconnected(&self, app: &AppHandle, guild_id: GuildId) {
+        self.stop_gemini_live_session(guild_id);
         if let Ok(mut guilds) = self.voice_guilds.lock() {
             guilds.remove(&guild_id.get());
         }
@@ -161,6 +167,50 @@ impl DiscordRuntime {
             }
         }
         self.emit_status(app);
+    }
+
+    fn set_gemini_live_session(&self, guild_id: GuildId, session: GeminiLiveVoiceSession) {
+        if let Ok(mut sessions) = self.gemini_live_sessions.lock() {
+            if let Some(mut previous) = sessions.insert(guild_id.get(), session) {
+                previous.stop();
+            }
+        }
+    }
+
+    fn stop_gemini_live_session(&self, guild_id: GuildId) {
+        if let Ok(mut sessions) = self.gemini_live_sessions.lock() {
+            if let Some(mut session) = sessions.remove(&guild_id.get()) {
+                session.stop();
+            }
+        }
+    }
+
+    fn has_gemini_live_session(&self, guild_id: GuildId) -> bool {
+        self.gemini_live_sessions
+            .lock()
+            .map(|sessions| sessions.contains_key(&guild_id.get()))
+            .unwrap_or(false)
+    }
+
+    fn gemini_live_connected(&self, guild_id: GuildId) -> bool {
+        self.gemini_live_sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .get(&guild_id.get())
+                    .map(GeminiLiveVoiceSession::is_connected)
+            })
+            .unwrap_or(false)
+    }
+
+    fn send_gemini_live_text(&self, guild_id: GuildId, text: &str) -> Result<(), String> {
+        self.gemini_live_sessions
+            .lock()
+            .map_err(|_| "Gemini Live session lock was poisoned".to_owned())?
+            .get(&guild_id.get())
+            .ok_or_else(|| "Gemini Live session is not active.".to_owned())?
+            .send_text(text)
     }
 
     fn set_voice_idle_monitor(
@@ -215,7 +265,33 @@ impl DiscordRuntime {
                     let connected = runtime.voice_connected(discord_guild_id);
                     let browser = if connected {
                         match browsers.status_guild(&app, &guild_id.to_string()).await {
-                            Ok(status) => Some(status),
+                            Ok(mut status) => {
+                                let configured_for_gemini = config::load_snapshot(&app)
+                                    .map(|config| config.voice_provider == "gemini-live")
+                                    .unwrap_or(false);
+                                if configured_for_gemini {
+                                    status.voice = Some("Gemini Live".to_owned());
+                                    status.voice_description = Some(
+                                        "Configured voice provider · Google Gemini Live".to_owned(),
+                                    );
+                                    status.voice_limit_reached = false;
+                                    status.voice_limit_reset = None;
+                                }
+                                if runtime.has_gemini_live_session(discord_guild_id) {
+                                    status.open = true;
+                                    status.logged_in = true;
+                                    status.auth_required = false;
+                                    status.voice_mode_active = true;
+                                    status.voice = Some("Gemini Live".to_owned());
+                                    status.voice_description = Some(
+                                        "Google Gemini Live · Native audio session".to_owned(),
+                                    );
+                                    status.voice_limit_reached = false;
+                                    status.voice_limit_reset = None;
+                                    status.chatgpt_mic_muted = Some(false);
+                                }
+                                Some(status)
+                            }
                             Err(error) => {
                                 let _ = app.emit(
                                     "runtime-log",
@@ -266,6 +342,11 @@ impl DiscordRuntime {
                             discord_guild_id,
                             connected,
                             browser.as_ref().and_then(|status| status.chatgpt_mic_muted),
+                            browser
+                                .as_ref()
+                                .and_then(|status| status.voice.as_deref())
+                                .map(|voice| voice == "Gemini Live")
+                                .unwrap_or(false),
                         ));
                     match channel_id
                         .edit_message(http.as_ref(), message_id, builder)
@@ -365,6 +446,11 @@ impl DiscordRuntime {
                 monitor.abort();
             }
         }
+        if let Ok(mut sessions) = self.gemini_live_sessions.lock() {
+            for (_, mut session) in sessions.drain() {
+                session.stop();
+            }
+        }
         if let Ok(mut http) = self.http.lock() {
             *http = None;
         }
@@ -380,8 +466,37 @@ struct Handler {
     study: crate::study::StudyRuntime,
 }
 
+#[derive(Clone)]
+enum VoiceAudioTransport {
+    ChatGpt(Arc<BrowserMediaTransport>),
+    GeminiLive(Arc<DirectPcmTransport>),
+}
+
+impl VoiceAudioTransport {
+    fn send_pcm_i16(&self, samples: &[i16]) -> bool {
+        match self {
+            Self::ChatGpt(media) => media.send_pcm_i16(samples),
+            Self::GeminiLive(media) => media.send_discord_audio(samples),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        match self {
+            Self::ChatGpt(media) => media.is_connected(),
+            Self::GeminiLive(media) => media.is_connected(),
+        }
+    }
+
+    fn provider_label(&self) -> &'static str {
+        match self {
+            Self::ChatGpt(_) => "ChatGPT Live Voice",
+            Self::GeminiLive(_) => "Gemini Live",
+        }
+    }
+}
+
 struct ReceiveToBrowser {
-    media: Arc<BrowserMediaTransport>,
+    media: VoiceAudioTransport,
     app: AppHandle,
     guild_id: GuildId,
     ticks: AtomicU64,
@@ -530,6 +645,10 @@ fn member_panel_embed(
 ) -> CreateEmbed {
     let browser_open = browser.map(|status| status.open).unwrap_or(false);
     let logged_in = browser.map(|status| status.logged_in).unwrap_or(false);
+    let gemini_live = browser
+        .and_then(|status| status.voice.as_deref())
+        .map(|voice| voice == "Gemini Live")
+        .unwrap_or(false);
     let voice_active = browser
         .map(|status| status.voice_mode_active)
         .unwrap_or(false);
@@ -543,10 +662,12 @@ fn member_panel_embed(
     } else if !connected {
         ("Not connected to a Discord voice channel", 0x5865F2)
     } else if !browser_open || !logged_in {
-        ("Waiting for the dedicated ChatGPT browser", 0xFEE75C)
+        ("Waiting for the voice provider", 0xFEE75C)
     } else if voice_active {
         (
-            if mic_muted == Some(true) {
+            if gemini_live {
+                "Connected · Gemini Live active"
+            } else if mic_muted == Some(true) {
                 "Connected · ChatGPT mic muted"
             } else {
                 "Connected · ChatGPT Voice active"
@@ -554,7 +675,7 @@ fn member_panel_embed(
             0x57F287,
         )
     } else {
-        ("Connected · ChatGPT Voice is not active", 0xFEE75C)
+        ("Connected · Voice assistant is not active", 0xFEE75C)
     };
 
     let thread = browser
@@ -575,8 +696,11 @@ fn member_panel_embed(
     let intelligence = browser.and_then(|status| status.intelligence.as_deref());
     let language = browser.and_then(|status| status.language.as_deref());
     let mut description = format!(
-        "**{state}**\nThis panel controls the shared GPTVoice session for this server. Voice auto-join is disabled: press Join voice or use /join when you want to talk. The bot leaves after 5 minutes without speech to preserve the ChatGPT Voice allowance."
+        "**{state}**\nThis panel controls the shared GPTVoice session for this server. Voice auto-join is disabled: press Join voice or use /join when you want to talk. The bot leaves after 5 minutes without speech to preserve the voice allowance."
     );
+    if gemini_live {
+        description.push_str("\n\nGemini Live processes voice audio through Google. On the free API tier, Google may use submitted content to improve its products. Make sure everyone in the channel has been informed before joining.");
+    }
     if let Some(last_action) = last_action.map(str::trim).filter(|value| !value.is_empty()) {
         description.push_str(&format!("\n\n_{last_action}_"));
     }
@@ -624,6 +748,7 @@ fn member_panel_components(
     guild_id: GuildId,
     connected: bool,
     mic_muted: Option<bool>,
+    gemini_live: bool,
 ) -> Vec<CreateActionRow> {
     let mic_label = match mic_muted {
         Some(true) => "Unmute input",
@@ -646,7 +771,7 @@ fn member_panel_components(
             } else {
                 ButtonStyle::Secondary
             })
-            .disabled(!connected || mic_muted.is_none()),
+            .disabled(!connected || gemini_live || mic_muted.is_none()),
         CreateButton::new(member_panel_custom_id("reconnect", guild_id))
             .label("Reconnect")
             .style(ButtonStyle::Primary)
@@ -1091,7 +1216,9 @@ impl Handler {
                 browser.as_ref(),
                 last_action,
             ))
-            .components(member_panel_components(guild_id, connected, mic_muted))
+            .components(member_panel_components(
+                guild_id, connected, mic_muted, false,
+            ))
     }
 
     async fn handle_member_panel_component(
@@ -1139,25 +1266,32 @@ impl Handler {
                 .to_owned()
             }
             MemberPanelAction::Reconnect => {
-                let status = self
-                    .browsers
-                    .reconnect_voice_guild(&self.app, &guild_id.to_string())
-                    .await?;
-                if status.voice_limit_reached {
-                    if let Some(reset) = status
-                        .voice_limit_reset
-                        .as_deref()
-                        .filter(|value| !value.is_empty())
-                    {
-                        format!("ChatGPT Voice reached its daily limit; it resets at {reset}.")
-                    } else {
-                        "ChatGPT Voice reached its daily limit.".to_owned()
-                    }
-                } else if status.voice_mode_active {
-                    "ChatGPT Voice reconnected to the active thread.".to_owned()
+                let config = config::load_snapshot(&self.app)?;
+                if config.voice_provider == "gemini-live" {
+                    let _ = self.leave_voice(context, Some(guild_id)).await;
+                    self.join_voice(context, Some(guild_id), component.user.id)
+                        .await
                 } else {
-                    "The browser refreshed, but ChatGPT Voice is not active. An administrator can start or resume a thread from the desktop panel."
+                    let status = self
+                        .browsers
+                        .reconnect_voice_guild(&self.app, &guild_id.to_string())
+                        .await?;
+                    if status.voice_limit_reached {
+                        if let Some(reset) = status
+                            .voice_limit_reset
+                            .as_deref()
+                            .filter(|value| !value.is_empty())
+                        {
+                            format!("ChatGPT Voice reached its daily limit; it resets at {reset}.")
+                        } else {
+                            "ChatGPT Voice reached its daily limit.".to_owned()
+                        }
+                    } else if status.voice_mode_active {
+                        "ChatGPT Voice reconnected to the active thread.".to_owned()
+                    } else {
+                        "The browser refreshed, but ChatGPT Voice is not active. An administrator can start or resume a thread from the desktop panel."
                         .to_owned()
+                    }
                 }
             }
         };
@@ -1195,6 +1329,11 @@ impl Handler {
             return "Join a voice channel in the configured DAS server first, then press /join again.".to_owned();
         };
 
+        let config = match config::load_snapshot(&self.app) {
+            Ok(config) => config,
+            Err(error) => return format!("Could not load GPTVoice configuration: {error}"),
+        };
+
         // Confirm the existing Songbird connection and its actual channel.
         // If the member has moved, rebuild the relay for their new room.
         if let Some(existing_call) = songbird.get(guild_id) {
@@ -1202,9 +1341,20 @@ impl Handler {
                 let call = existing_call.lock().await;
                 (call.current_channel(), call.current_connection().is_some())
             };
-            if connected && current_channel == Some(channel_id.into()) {
+            let active_provider_matches = voice_provider_matches(
+                &config.voice_provider,
+                self.runtime.has_gemini_live_session(guild_id),
+            );
+            if connected && current_channel == Some(channel_id.into()) && active_provider_matches {
                 self.runtime.mark_voice_connected(&self.app, guild_id);
-                return "GPTVoice is already connected to this server's voice channel.".to_owned();
+                return format!(
+                    "GPTVoice is already connected using {}.",
+                    if config.voice_provider == "gemini-live" {
+                        "Gemini Live"
+                    } else {
+                        "ChatGPT Live Voice"
+                    }
+                );
             }
 
             if current_channel.is_some() && !connected {
@@ -1214,9 +1364,20 @@ impl Handler {
                 let call = existing_call.lock().await;
                 (call.current_channel(), call.current_connection().is_some())
             };
-            if connected && current_channel == Some(channel_id.into()) {
+            let active_provider_matches = voice_provider_matches(
+                &config.voice_provider,
+                self.runtime.has_gemini_live_session(guild_id),
+            );
+            if connected && current_channel == Some(channel_id.into()) && active_provider_matches {
                 self.runtime.mark_voice_connected(&self.app, guild_id);
-                return "GPTVoice is already connected to this server's voice channel.".to_owned();
+                return format!(
+                    "GPTVoice is already connected using {}.",
+                    if config.voice_provider == "gemini-live" {
+                        "Gemini Live"
+                    } else {
+                        "ChatGPT Live Voice"
+                    }
+                );
             }
 
             let moving = connected || current_channel.is_some();
@@ -1241,51 +1402,91 @@ impl Handler {
             let _ = self.app.emit("runtime-log", message);
         }
 
-        let browser = match self
-            .browsers
-            .start_guild(&self.app, &guild_id.to_string())
-            .await
+        let (voice_transport, reader, pending_gemini_session) = match config.voice_provider.as_str()
         {
-            Ok(browser) => browser,
-            Err(error) => {
-                return format!("I could not start the dedicated ChatGPT browser: {error}");
+            "gemini-live" => {
+                if !config.gemini_live_terms_accepted {
+                    return "Gemini Live is selected but its data-use notice has not been accepted. An administrator must open GPTVoice > Config, review the Gemini Live notice, and explicitly accept it before using this provider.".to_owned();
+                }
+                let api_key = match config::load_gemini_api_key(&self.app) {
+                    Ok(key) => key,
+                    Err(error) => return error,
+                };
+                let session = match GeminiLiveVoiceSession::connect(
+                    &api_key,
+                    config.audio_input_volume as f32,
+                    config.audio_output_volume as f32,
+                )
+                .await
+                {
+                    Ok(session) => session,
+                    Err(error) => return format!("Could not start Gemini Live: {error}"),
+                };
+                let transport = session.transport();
+                let reader = match transport
+                    .take_pcm_reader_with_gain(config.audio_output_volume as f32)
+                {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        return format!("Could not attach Gemini Live output to Discord: {error}")
+                    }
+                };
+                (
+                    VoiceAudioTransport::GeminiLive(transport),
+                    reader,
+                    Some(session),
+                )
             }
-        };
-        if !browser.logged_in {
-            let _ = self
-                .browsers
-                .stop_guild(&self.app, &guild_id.to_string())
-                .await;
-            return "The dedicated ChatGPT profile needs sign-in. Complete the browser setup, then press /join again.".to_owned();
-        }
+            "chatgpt" => {
+                let browser = match self
+                    .browsers
+                    .start_guild(&self.app, &guild_id.to_string())
+                    .await
+                {
+                    Ok(browser) => browser,
+                    Err(error) => {
+                        return format!("I could not start the dedicated ChatGPT browser: {error}");
+                    }
+                };
+                if !browser.logged_in {
+                    let _ = self
+                        .browsers
+                        .stop_guild(&self.app, &guild_id.to_string())
+                        .await;
+                    return "The dedicated ChatGPT profile needs sign-in. Complete the browser setup, then press /join again.".to_owned();
+                }
 
-        let media = match self
-            .browsers
-            .media_for_guild(&self.app, &guild_id.to_string())
-            .await
-        {
-            Ok(media) => media,
-            Err(error) => {
-                let _ = self
+                let media = match self
                     .browsers
-                    .stop_guild(&self.app, &guild_id.to_string())
-                    .await;
-                return format!("I could not start the browser audio transport: {error}");
-            }
-        };
-        let reader = match self
-            .browsers
-            .take_media_reader(&self.app, &guild_id.to_string())
-            .await
-        {
-            Ok(reader) => reader,
-            Err(error) => {
-                let _ = self
+                    .media_for_guild(&self.app, &guild_id.to_string())
+                    .await
+                {
+                    Ok(media) => media,
+                    Err(error) => {
+                        let _ = self
+                            .browsers
+                            .stop_guild(&self.app, &guild_id.to_string())
+                            .await;
+                        return format!("I could not start the browser audio transport: {error}");
+                    }
+                };
+                let reader = match self
                     .browsers
-                    .stop_guild(&self.app, &guild_id.to_string())
-                    .await;
-                return format!("I could not attach ChatGPT audio to Discord: {error}");
+                    .take_media_reader(&self.app, &guild_id.to_string())
+                    .await
+                {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        let _ = self
+                            .browsers
+                            .stop_guild(&self.app, &guild_id.to_string())
+                            .await;
+                        return format!("I could not attach ChatGPT audio to Discord: {error}");
+                    }
+                };
+                (VoiceAudioTransport::ChatGpt(media), reader, None)
             }
+            other => return format!("Unsupported voice provider: {other}"),
         };
 
         // Songbird can emit receive events during the voice join handshake.
@@ -1305,7 +1506,7 @@ impl Handler {
             call.add_global_event(
                 CoreEvent::VoiceTick.into(),
                 ReceiveToBrowser {
-                    media: Arc::clone(&media),
+                    media: voice_transport.clone(),
                     app: self.app.clone(),
                     guild_id,
                     ticks: AtomicU64::new(0),
@@ -1316,11 +1517,17 @@ impl Handler {
 
         if let Err(error) = songbird.join(guild_id, channel_id).await {
             let _ = songbird.remove(guild_id).await;
-            let _ = self
-                .browsers
-                .stop_guild(&self.app, &guild_id.to_string())
-                .await;
+            if pending_gemini_session.is_none() {
+                let _ = self
+                    .browsers
+                    .stop_guild(&self.app, &guild_id.to_string())
+                    .await;
+            }
             return format!("I could not join that voice channel: {error}");
+        }
+
+        if let Some(session) = pending_gemini_session {
+            self.runtime.set_gemini_live_session(guild_id, session);
         }
 
         // Start the Discord playback track only after the call has joined.
@@ -1356,52 +1563,76 @@ impl Handler {
         let _ = self.app.emit(
             "runtime-log",
             format!(
-                "Joined Discord voice and opened ChatGPT for guild {}.",
+                "Joined Discord voice using {} for guild {}.",
+                voice_transport.provider_label(),
                 guild_id.get()
             ),
         );
 
-        // Starting the Discord relay only opens the dedicated ChatGPT page.
-        // Explicitly activate ChatGPT Voice after the Discord connection is ready
-        // so a fresh launch or automatic rejoin is immediately conversational.
-        let voice_active = match self
-            .browsers
-            .reconnect_voice_guild(&self.app, &guild_id.get().to_string())
-            .await
-        {
-            Ok(status) if status.voice_mode_active => {
-                let _ = self.app.emit(
-                    "runtime-log",
-                    format!(
-                        "[voice:{}] ChatGPT Voice is active after the explicit join.",
-                        guild_id.get()
-                    ),
-                );
-                true
+        let voice_active = match &voice_transport {
+            VoiceAudioTransport::GeminiLive(_) => {
+                let greeting = "يا هلا فيكم، حيّاكم الله معنا في روم DAS.";
+                match self.runtime.send_gemini_live_text(guild_id, greeting) {
+                    Ok(()) => {
+                        let _ = self.app.emit(
+                            "runtime-log",
+                            format!(
+                                "[voice:{}] Gemini Live is active after explicit /join.",
+                                guild_id.get()
+                            ),
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        let _ = self.app.emit(
+                            "runtime-log",
+                            format!("[voice:{}] Gemini greeting failed: {error}", guild_id.get()),
+                        );
+                        false
+                    }
+                }
             }
-            Ok(_) => {
-                let _ = self.app.emit(
-                    "runtime-log",
-                    format!(
-                        "[voice:{}] Discord relay is ready, but ChatGPT Voice did not become active.",
-                        guild_id.get()
-                    ),
-                );
-                false
-            }
-            Err(error) => {
-                let _ = self.app.emit(
-                    "runtime-log",
-                    format!(
-                        "[voice:{}] Could not start ChatGPT Voice after the explicit join: {error}",
-                        guild_id.get()
-                    ),
-                );
-                false
+            VoiceAudioTransport::ChatGpt(_) => {
+                match self
+                    .browsers
+                    .reconnect_voice_guild(&self.app, &guild_id.get().to_string())
+                    .await
+                {
+                    Ok(status) if status.voice_mode_active => {
+                        let _ = self.app.emit(
+                            "runtime-log",
+                            format!(
+                                "[voice:{}] ChatGPT Voice is active after the explicit join.",
+                                guild_id.get()
+                            ),
+                        );
+                        true
+                    }
+                    Ok(_) => {
+                        let _ = self.app.emit(
+                            "runtime-log",
+                            format!(
+                                "[voice:{}] Discord relay is ready, but ChatGPT Voice did not become active.",
+                                guild_id.get()
+                            ),
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        let _ = self.app.emit(
+                            "runtime-log",
+                            format!(
+                                "[voice:{}] Could not start ChatGPT Voice after the explicit join: {error}",
+                                guild_id.get()
+                            ),
+                        );
+                        false
+                    }
+                }
             }
         };
 
-        if voice_active {
+        if voice_active && matches!(voice_transport, VoiceAudioTransport::ChatGpt(_)) {
             let greeting = "You are DAS Bot, the friendly voice assistant for DAS. Greet the group in a natural Saudi Arabic voice. Say exactly: يا هلا فيكم، حيّاكم الله معنا في روم DAS. Do not mention any name or prior conversation.";
             if let Err(error) = self
                 .browsers
@@ -1426,6 +1657,21 @@ impl Handler {
                 if !runtime.voice_connected(guild_id) {
                     break;
                 }
+                if runtime.has_gemini_live_session(guild_id)
+                    && !runtime.gemini_live_connected(guild_id)
+                {
+                    let message = format!(
+                        "[voice:{}] Gemini Live disconnected unexpectedly; leaving Discord voice to avoid a silent session.",
+                        guild_id.get()
+                    );
+                    log::warn!("{message}");
+                    let _ = app.emit("runtime-log", message);
+                    if let Some(songbird) = songbird::get(&monitor_context).await {
+                        let _ = songbird.leave(guild_id).await;
+                    }
+                    runtime.mark_voice_disconnected(&app, guild_id);
+                    break;
+                }
                 let idle_for = activity
                     .lock()
                     .map(|last_activity| last_activity.elapsed())
@@ -1435,7 +1681,7 @@ impl Handler {
                 }
 
                 let message = format!(
-                    "[voice:{}] No speech detected for {} minutes; stopping ChatGPT Voice and leaving Discord to preserve the voice allowance.",
+                    "[voice:{}] No speech detected for {} minutes; stopping the active voice provider and leaving Discord to preserve the allowance.",
                     guild_id.get(),
                     VOICE_IDLE_TIMEOUT.as_secs() / 60
                 );
@@ -1461,7 +1707,7 @@ impl Handler {
         self.runtime.set_voice_idle_monitor(guild_id, idle_monitor);
 
         format!(
-            "Joined your voice channel. GPTVoice will leave automatically after {} minutes without speech to protect the ChatGPT Voice allowance. Use /join or the Join voice button to reconnect.",
+            "Joined your voice channel using the selected voice provider. GPTVoice will leave automatically after {} minutes without speech to protect the voice allowance. Use /join or the Join voice button to reconnect.",
             VOICE_IDLE_TIMEOUT.as_secs() / 60
         )
     }
@@ -1478,8 +1724,15 @@ impl Handler {
             .browsers
             .stop_guild(&self.app, &guild_id.to_string())
             .await;
-        "Left the Discord voice channel and stopped this guild's ChatGPT browser session."
-            .to_owned()
+        "Left the Discord voice channel and stopped the active voice provider session.".to_owned()
+    }
+}
+
+fn voice_provider_matches(configured_provider: &str, gemini_session_active: bool) -> bool {
+    match configured_provider {
+        "chatgpt" => !gemini_session_active,
+        "gemini-live" => gemini_session_active,
+        _ => false,
     }
 }
 
@@ -1599,6 +1852,15 @@ mod tests {
     }
 
     #[test]
+    fn selected_voice_provider_replaces_a_different_active_provider() {
+        assert!(voice_provider_matches("chatgpt", false));
+        assert!(!voice_provider_matches("chatgpt", true));
+        assert!(voice_provider_matches("gemini-live", true));
+        assert!(!voice_provider_matches("gemini-live", false));
+        assert!(!voice_provider_matches("unknown", false));
+    }
+
+    #[test]
     fn member_panel_action_ids_are_server_scoped() {
         let guild_id = GuildId::new(964597969980620820);
         let custom_id = member_panel_custom_id("reconnect", guild_id);
@@ -1619,7 +1881,7 @@ mod tests {
     #[test]
     fn member_panel_has_compact_controls_and_updates_mic_label() {
         let guild_id = GuildId::new(964597969980620820);
-        let components = member_panel_components(guild_id, true, Some(false));
+        let components = member_panel_components(guild_id, true, Some(false), false);
         let value = serde_json::to_value(components).expect("components should serialize");
         let buttons = value[0]["components"]
             .as_array()
@@ -1632,8 +1894,9 @@ mod tests {
         assert_eq!(buttons[0]["disabled"], true);
         assert_eq!(buttons[1]["disabled"], false);
 
-        let muted = serde_json::to_value(member_panel_components(guild_id, true, Some(true)))
-            .expect("muted components should serialize");
+        let muted =
+            serde_json::to_value(member_panel_components(guild_id, true, Some(true), false))
+                .expect("muted components should serialize");
         assert_eq!(muted[0]["components"][2]["label"], "Unmute input");
     }
 

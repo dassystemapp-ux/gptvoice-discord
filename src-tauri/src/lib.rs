@@ -260,6 +260,13 @@ fn spawn_runtime_start(app: &AppHandle) {
         }
 
         let guild_id = config.discord_guild_id.trim().to_owned();
+        if config.voice_provider == "gemini-live" {
+            let _ = app.emit(
+                "runtime-log",
+                "Voice provider is Gemini Live. ChatGPT browser prefetch is skipped; no ChatGPT Live Voice session will be started.",
+            );
+            return;
+        }
         if guild_id.is_empty() {
             let _ = app.emit(
                 "runtime-log",

@@ -1,6 +1,7 @@
 pub mod config;
 pub mod context;
 pub mod gemini;
+pub mod gemini_live;
 pub mod openai;
 pub mod prompts;
 pub mod provider;

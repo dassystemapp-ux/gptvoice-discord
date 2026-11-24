@@ -667,6 +667,129 @@ impl BrowserMediaTransport {
     }
 }
 
+/// Direct PCM transport used by native realtime voice providers such as Gemini Live.
+/// Discord input and provider output stay inside the native process; no browser socket is required.
+pub struct DirectPcmTransport {
+    inner: Arc<TransportInner>,
+    input: Arc<RealtimePacketQueue>,
+    output: Arc<RealtimePcmQueue>,
+}
+
+impl DirectPcmTransport {
+    pub fn new(input_gain: f32, output_gain: f32) -> Arc<Self> {
+        let input = Arc::new(RealtimePacketQueue::new(8));
+        let output = Arc::new(RealtimePcmQueue::new(32));
+        let inner = Arc::new(TransportInner {
+            endpoint: String::new(),
+            token: String::new(),
+            to_browser: Mutex::new(None),
+            from_browser: Arc::clone(&output),
+            reader: Mutex::new(Some(Arc::clone(&output))),
+            shutdown: Mutex::new(None),
+            next_connection_id: AtomicU64::new(1),
+            active_connection_id: AtomicU64::new(1),
+            connected: AtomicBool::new(true),
+            packets_sent: AtomicU64::new(0),
+            packets_dropped: AtomicU64::new(0),
+            packets_received: AtomicU64::new(0),
+            reader_reads: AtomicU64::new(0),
+            reader_source_bytes: AtomicU64::new(0),
+            reader_output_bytes: AtomicU64::new(0),
+            reader_silence_bytes: AtomicU64::new(0),
+            input_gain_bits: AtomicU32::new(input_gain.clamp(0.0, 4.0).to_bits()),
+            output_gain_bits: AtomicU32::new(output_gain.clamp(0.0, 4.0).to_bits()),
+            browser_diagnostics: Mutex::new(BrowserBridgeDiagnostics::default()),
+            latency: Mutex::new(LatencyState::default()),
+        });
+
+        Arc::new(Self {
+            inner,
+            input,
+            output,
+        })
+    }
+
+    pub fn send_discord_audio(&self, samples: &[i16]) -> bool {
+        if samples.is_empty() || !self.inner.connected.load(Ordering::Relaxed) {
+            return false;
+        }
+        let gain = self.inner.input_gain();
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            let scaled = ((*sample as f32) * gain)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            bytes.extend_from_slice(&scaled.to_le_bytes());
+        }
+        match self.input.push(bytes) {
+            Ok(dropped) => {
+                if dropped {
+                    self.inner.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                self.inner.packets_sent.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => {
+                self.inner.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    pub async fn next_discord_audio(&self) -> Option<Vec<u8>> {
+        self.input.pop().await
+    }
+
+    pub fn push_gemini_output(&self, samples: &[i16]) -> bool {
+        if samples.is_empty() || !self.inner.connected.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        match self.output.push(bytes) {
+            Ok(dropped) => {
+                if dropped {
+                    self.inner.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                self.inner.packets_received.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => {
+                self.inner.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    pub fn clear_output(&self) {
+        self.output.clear();
+    }
+
+    pub fn take_pcm_reader_with_gain(&self, gain: f32) -> Result<PcmReader, String> {
+        self.inner.set_output_gain(gain);
+        let receiver = self
+            .inner
+            .reader
+            .lock()
+            .map_err(|_| "Gemini Live PCM reader lock was poisoned".to_owned())?
+            .take()
+            .ok_or_else(|| "Gemini Live output is already attached to Discord".to_owned())?;
+        Ok(PcmReader::new(receiver, gain, Arc::clone(&self.inner)))
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.inner.connected.load(Ordering::Relaxed)
+    }
+
+    pub fn stop(&self) {
+        self.inner.connected.store(false, Ordering::Relaxed);
+        self.input.close();
+        self.output.close();
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserMediaDiagnostics {
@@ -1165,6 +1288,27 @@ mod tests {
         sender_thread.join().expect("sender thread should finish");
         let sample = f32::from_ne_bytes(output);
         assert!((sample - 0.5).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn direct_voice_transport_queues_discord_input_and_gemini_output() {
+        let transport = DirectPcmTransport::new(1.0, 1.0);
+        let input = [100_i16, -100_i16, 200_i16, -200_i16];
+        assert!(transport.send_discord_audio(&input));
+        let queued = transport
+            .next_discord_audio()
+            .await
+            .expect("Discord PCM should reach the Live API input queue");
+        assert_eq!(queued.len(), input.len() * 2);
+        assert_eq!(i16::from_le_bytes([queued[0], queued[1]]), 100);
+
+        let output = vec![300_i16; 2_048];
+        assert!(transport.push_gemini_output(&output));
+        let reader = transport
+            .take_pcm_reader_with_gain(1.0)
+            .expect("Gemini output reader should attach to Songbird");
+        drop(reader);
+        transport.stop();
     }
 
     #[test]
