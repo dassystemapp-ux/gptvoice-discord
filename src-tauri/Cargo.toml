@@ -1,6 +1,6 @@
 [package]
 name = "gptvoice-tauri"
-version = "0.1.4"
+version = "0.1.5"
 description = "GPTVoice native desktop panel and Discord voice relay"
 authors = ["mutedvector"]
 license = "MIT"
