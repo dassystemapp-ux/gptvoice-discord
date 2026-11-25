@@ -87,3 +87,11 @@ No production worker deployment, provider API usage, or paid infrastructure acti
 - Keep the current GPTVoice desktop path operational while new DAS Core API behavior is introduced behind a feature flag.
 - Do not force OpenAI or another billable provider as primary before the provider budget and model selection are approved.
 - Existing Gemini provider behavior and tests remain regression gates.
+
+
+## 11. Shared DAS identity and independent product engines
+
+GPTVoice is one capability inside the unified DAS account, not a separate customer identity system. The Firebase UID remains canonical. Discord identity is linked to that account through the Core API. Voice preferences and entitlements are shared account capabilities.
+
+DAS products retain independent experience engines under one account and dashboard. The Discord worker may surface product-aware learning interactions only after Core API confirms the user's identity and entitlement. Voice usage Credits remain a separate billing ledger from product purchase entitlements.
+
