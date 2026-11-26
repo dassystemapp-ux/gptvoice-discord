@@ -20,10 +20,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: voice-worker/package-lock.json
       - name: Install dependencies
         working-directory: voice-worker
-        run: npm install --package-lock-only && npm ci
+        run: npm install
       - name: Run worker tests
         working-directory: voice-worker
         run: npm test
