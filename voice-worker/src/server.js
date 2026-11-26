@@ -100,7 +100,7 @@ wss.on("connection", client => {
           input: {
             format: { type: "audio/pcm", rate: 24000 },
             noise_reduction: { type: "near_field" },
-            turn_detection: { type: "server_vad", threshold: 0.55, prefix_padding_ms: 240, silence_duration_ms: 450, interrupt_response: true, create_response: true }
+            turn_detection: { type: "server_vad", threshold: 0.55, prefix_padding_ms: 240, silence_duration_ms: 900, interrupt_response: true, create_response: true }
           },
           output: { format: { type: "audio/pcm", rate: 24000 }, voice: VOICE }
         },
