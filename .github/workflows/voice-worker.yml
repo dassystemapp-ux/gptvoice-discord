@@ -1,0 +1,29 @@
+name: Voice worker checks
+
+on:
+  push:
+    branches: [feat/das-core-api-foundation]
+    paths:
+      - "voice-worker/**"
+      - ".github/workflows/voice-worker.yml"
+  pull_request:
+    paths:
+      - "voice-worker/**"
+      - ".github/workflows/voice-worker.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: voice-worker/package-lock.json
+      - name: Install dependencies
+        working-directory: voice-worker
+        run: npm install --package-lock-only && npm ci
+      - name: Run worker tests
+        working-directory: voice-worker
+        run: npm test
