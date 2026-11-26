@@ -1,5 +1,5 @@
 import http from "node:http";
-import { timingSafeEqual, randomBytes } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -71,6 +71,7 @@ wss.on("connection", client => {
   const close = () => {
     if (session.closed) return;
     session.closed = true;
+    clearTimeout(timer);
     sessions.delete(session);
     try { session.upstream?.close(); } catch {}
     try { client.close(); } catch {}
@@ -128,9 +129,6 @@ wss.on("connection", client => {
     try { event = JSON.parse(data.toString()); } catch { return; }
     if (event.type === "audio.append" && typeof event.audio === "string" && event.audio.length <= 48000) {
       upstream.send(JSON.stringify({ type: "input_audio_buffer.append", audio: event.audio }));
-    } else if (event.type === "audio.commit") {
-      upstream.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      upstream.send(JSON.stringify({ type: "response.create" }));
     } else if (event.type === "response.cancel") {
       upstream.send(JSON.stringify({ type: "response.cancel" }));
     } else if (event.type === "session.close") {
