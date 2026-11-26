@@ -5,8 +5,8 @@ This is a trusted-server adapter for the DAS Discord voice client. The OpenAI AP
 ## Current scope
 
 - Opens a server-owned WebSocket connection to `gpt-realtime-2.1-mini`.
-- Configures Saudi Arabic DAS instructions, PCM16 24 kHz, near-field noise reduction, server VAD and interruption.
-- Relays audio append/commit/cancel events and model events.
+- Configures Saudi Arabic DAS instructions, PCM16 24 kHz, near-field noise reduction, server VAD (900 ms silence window) and interruption.
+- Relays bounded audio append/cancel events and model events. Server VAD owns turn finalization; the client does not send manual commit events.
 - Enforces one concurrent session, a maximum three-minute session and a localhost-only listener by default.
 - Requires a separate high-entropy worker token.
 
@@ -30,7 +30,6 @@ The local client connects to `ws://127.0.0.1:8787` with header `x-das-worker-tok
 
 Client messages:
 - `{"type":"audio.append","audio":"<base64 PCM16 24 kHz mono>"}`
-- `{"type":"audio.commit"}`
 - `{"type":"response.cancel"}`
 - `{"type":"session.close"}`
 
